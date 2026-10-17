@@ -1,0 +1,11 @@
+retrieval:
+  bm25_k: 20
+  dense_model: BAAI/bge-m3
+  dense_k: 20
+  rrf_k: 60
+  top_n: 5
+rerank:
+  model: BAAI/bge-reranker-v2-m3
+  enabled: false
+verifier:
+  enabled: false
