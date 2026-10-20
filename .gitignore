@@ -5,3 +5,5 @@ data/raw/
 data/index/
 runs/
 .env
+data/processed/
+data/cache/
