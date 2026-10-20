@@ -66,5 +66,6 @@ def load_turns(dial_path: Path, doc_path: Path) -> list[Turn]:
                     query=_clean(utts[i - 1]["utterance"]),
                     gold_pids=gold,
                     answerable=answerable,
+                    user_act=utts[i - 1]["da"],
                 ))
     return turns

@@ -1,3 +1,7 @@
+query:
+  history_turns: 4    # utterances, i.e. two user/agent rounds
+  short_words: 8      # gated: add history only to utterances this short (picked on train, scripts/select_gate.py)
+  max_words: 96       # ~p85 of 4-utterance queries; keeps dense query encoding under ~128 tokens
 retrieval:
   bm25_k: 20
   dense_model: BAAI/bge-m3

@@ -8,7 +8,8 @@ answering confidently when the documents **don't cover** the question. This proj
 pipeline (no free-form agent loop) with an explicit evidence verifier, and evaluates each failure mode
 separately.
 
-> Status: early work in progress. Numbers below will be filled in only from runs in this repo.
+> Status: work in progress. Every number below comes from a run in this repo; stages without numbers
+> are not built yet.
 
 ## Pipeline
 
@@ -28,12 +29,40 @@ Each stage is a plain function with typed inputs/outputs so it can be ablated on
 
 Raw data is not committed; see `scripts/download_data.py`.
 
-## Evaluation (planned)
+## Evaluation
 
-- Retrieval: Recall@k, MRR against gold grounding spans
-- Citation accuracy: answer cites a span that overlaps gold
-- Version accuracy: on the version split, cites the version effective on the query date
-- Refusal: precision/recall of refusing on unanswerable turns
+- Retrieval: Recall@k, MRR against gold grounding sections
+- Citation accuracy (planned): answer cites a span that overlaps gold
+- Version accuracy (planned): on the version split, cites the version effective on the query date
+- Refusal (planned): precision/recall of refusing on unanswerable turns
+
+### Retrieval on MultiDoc2Dial
+
+Setup: 488 documents split into 13,421 section-level passages (heading path prepended). Each agent
+response is one evaluation point: the query is the preceding user utterance, the gold passage is the
+section holding the agent's grounding span. Validation split, 4,201 answerable turns. BM25 and dense
+(bge-m3) each return top 20; RRF with k = 60.
+
+**Query construction.** Short follow-ups ("yes", "no, it was cancelled") answer the agent rather than ask
+something, and cannot be retrieved on their own; longer ones are usually self-contained, and adding
+history only dilutes them. So the query is the current utterance alone, plus the last two user/agent
+rounds (capped at 96 words, oldest dropped first) only when the utterance has at most 8 words. The
+threshold was picked from 3–10 words by RRF Recall@5 on 4,000 sampled train turns
+(`scripts/select_gate.py`).
+
+| Retriever | Query | R@1 | R@5 | R@10 | R@20 | MRR@20 |
+|---|---|---|---|---|---|---|
+| BM25 | current utterance | 0.104 | 0.290 | 0.367 | 0.446 | 0.190 |
+| bge-m3 | current utterance | 0.097 | 0.318 | 0.403 | 0.484 | 0.193 |
+| RRF | current utterance | 0.132 | 0.356 | 0.430 | 0.502 | 0.231 |
+| BM25 | length-gated history | 0.135 | 0.362 | 0.448 | 0.537 | 0.238 |
+| bge-m3 | length-gated history | 0.137 | 0.403 | 0.499 | 0.591 | 0.253 |
+| **RRF** | **length-gated history** | **0.166** | **0.434** | **0.527** | **0.603** | **0.284** |
+| RRF | oracle gate (gold dialogue act; upper bound) | 0.173 | 0.443 | 0.529 | 0.612 | 0.292 |
+
+Single-query latency on a laptop (Apple M5 Pro): BM25 30 ms, bge-m3 24 ms with the gated query.
+
+Reproduce: `python scripts/eval_retrieval.py --split validation --query-mode last gated oracle`.
 
 ## Layout
 
@@ -51,8 +80,8 @@ tests/         unit tests for metrics and fusion
 ## Setup
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+uv venv --python 3.12 .venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
 python scripts/download_data.py
 pytest
 ```

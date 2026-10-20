@@ -24,3 +24,4 @@ class Turn:
     gold_pids: list[str] = field(default_factory=list)
     answerable: bool = True
     as_of: date | None = None
+    user_act: str | None = None
