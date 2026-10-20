@@ -59,3 +59,31 @@ def test_router_text_and_threshold():
     emb = np.array([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]])
     router = DomainRouter().fit(emb, ["dmv", "dmv", "va", "va"])
     assert router.route(np.array([[1.0, 0.0], [0.5, 0.5]]), threshold=0.55) == ["dmv", None]
+
+
+def test_units_hold_their_spans():
+    from vpqa.data.multidoc2dial import _doc_units
+
+    def span(sp, sec, title, start, text):
+        return {"id_sp": sp, "id_sec": sec, "title": title, "parent_titles": [], "start_sp": start,
+                "end_sp": start + len(text), "text_sp": text, "text_sec": text}
+
+    text = "Intro " + " ".join(f"w{i}" for i in range(150))
+    doc = {"title": "Doc#1", "doc_text": text, "spans": {
+        "1": span("1", "t_0", "Intro", 0, "Intro "),
+        "2": span("2", "1", "Intro", 6, text[6:500]),
+        "3": span("3", "2", "Other", 500, text[500:])}}
+    assert [held for _, _, held in _doc_units(doc, "section")] == [["1"], ["2"], ["3"]]
+    assert [held for _, _, held in _doc_units(doc, "heading")] == [["1", "2"], ["3"]]  # same title merges
+    token = _doc_units(doc, "token")
+    assert len(token) == 2 and token[0][1].startswith("Doc\nIntro w0")
+    assert "2" in token[0][2] and "2" in token[1][2]  # a span cut by the window belongs to both
+
+
+def test_span_recall_within_budget():
+    from vpqa.eval.metrics import span_recall_within
+
+    words = {"a": 50, "b": 300, "c": 50}
+    span_pids = {"s1": ["a"], "s2": ["c"]}
+    assert span_recall_within(["a", "c", "b"], ["s1", "s2"], span_pids, words, 200) == 1.0
+    assert span_recall_within(["a", "b", "c"], ["s1", "s2"], span_pids, words, 200) == 0.5  # stops at b

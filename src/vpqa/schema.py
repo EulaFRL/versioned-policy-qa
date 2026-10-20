@@ -22,6 +22,7 @@ class Turn:
     history: list[str]
     query: str
     gold_pids: list[str] = field(default_factory=list)
+    gold_spans: list[str] = field(default_factory=list)  # "doc_id::id_sp" grounding spans, independent of the retrieval unit
     answerable: bool = True
     as_of: date | None = None
     user_act: str | None = None

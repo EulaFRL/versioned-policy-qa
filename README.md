@@ -31,7 +31,8 @@ Raw data is not committed; see `scripts/download_data.py`.
 
 ## Evaluation
 
-- Retrieval: Recall@k, MRR against gold grounding sections
+- Retrieval: Recall@k, MRR against gold grounding sections; Hit@k and Ctx@W (gold text within a word
+  budget) when comparing retrieval units
 - Citation accuracy (planned): answer cites a span that overlaps gold
 - Version accuracy (planned): on the version split, cites the version effective on the query date
 - Refusal (planned): precision/recall of refusing on unanswerable turns
@@ -94,6 +95,46 @@ on, and a wrong domain removes the gold passage outright) and follow-ups (0.7).
 On validation the router restricts 89.6% of turns (60.2% of first turns) and picks the right domain for
 99.3% of them.
 
+**Retrieval unit.** Sections are small (median 30 words). The MultiDoc2Dial paper uses two coarser units,
+rebuilt here from its released preprocessing code with identical passage counts: `heading` merges
+consecutive spans that share a section or a title (4,110 passages, mean 112 words), `token` cuts the
+document text every 100 tokens (4,283 passages, title prepended). A coarser unit holds more text, so
+the gold passage enters the top k more easily; Hit@k (any gold passage in the top k) therefore cannot
+compare units. Ctx@W can: the share of gold grounding spans inside the first W words of retrieved text
+(whole passages in rank order), i.e. at the same reader budget. Gated query, no routing:
+
+| Unit | RRF Hit@5 | + rerank Hit@1 | Hit@5 | Hit@10 | RRF Ctx@200 | + rerank Ctx@200 | Ctx@500 |
+|---|---|---|---|---|---|---|---|
+| **section** | 0.432 | 0.217 | 0.533 | 0.612 | **0.393** | **0.473** | 0.611 |
+| heading | 0.613 | 0.415 | 0.700 | 0.768 | 0.321 | 0.375 | 0.599 |
+| token (100) | 0.592 | 0.408 | 0.674 | 0.740 | 0.316 | 0.409 | **0.637** |
+
+Hit@5 favours coarse units by 14–18 points, but at a 200-word budget sections carry the most gold text:
+a few short sections fit where a coarse passage spends the budget on its neighbours. At 500 words the
+100-token windows are slightly ahead. The unit stays `section`; which unit is best depends on how much
+retrieved text the reader gets, which is fixed with the generator.
+
+**Comparison with the MultiDoc2Dial paper** (Feng et al., 2021, Table 5; validation, R@k there means
+Hit@k here). The paper's query is the current turn followed by the whole history, most recent first;
+here that is the `history` query mode (96 words).
+
+| Unit | Retriever | Query | Hit@1 | Hit@5 | Hit@10 |
+|---|---|---|---|---|---|
+| heading | BM25 (paper) | history | 0.196 | 0.419 | 0.508 |
+| heading | BM25 | history | 0.227 | 0.472 | 0.558 |
+| heading | DPR, NQ-trained (paper) | history | 0.155 | 0.353 | 0.456 |
+| heading | bge-m3 | history | 0.240 | 0.510 | 0.619 |
+| heading | DPR fine-tuned on MultiDoc2Dial (paper) | history | 0.490 | 0.723 | 0.800 |
+| heading | RRF | gated | 0.342 | 0.613 | 0.698 |
+| heading | RRF + rerank all | gated | 0.415 | 0.700 | 0.768 |
+| token | BM25 (paper) | history | 0.195 | 0.427 | 0.514 |
+| token | BM25 | history | 0.226 | 0.470 | 0.560 |
+
+BM25 lands 3–5 points above the paper with the same units and query style (tokenisation and the
+96-word cap differ). The gated query alone is worth 9 points of Hit@5 over the paper's query on the
+same units (RRF 0.523 → 0.613). Nothing here is trained on MultiDoc2Dial passages, and the paper's
+fine-tuned DPR is still ahead, by 7.5 points at Hit@1 and 2.3 at Hit@5 against gated RRF + rerank.
+
 **Latency** for one query at a time on a laptop (Apple M5 Pro), gated query: BM25 17 ms, bge-m3 17 ms,
 router 25 ms, rerank of 40 candidates about 250 ms (55 ms for 10, 128 ms for 20). Rerank is the most
 expensive retrieval stage.
@@ -106,6 +147,8 @@ python scripts/train_router.py
 python scripts/eval_retrieval.py --query-mode last gated oracle --rerank 10 20 40
 python scripts/eval_retrieval.py --query-mode gated --rerank 40 --rerank-query recent:4
 python scripts/eval_retrieval.py --query-mode gated --rerank 40 --route router   # or --route oracle
+python scripts/eval_retrieval.py --unit heading --query-mode history                # or --unit token / section
+python scripts/eval_retrieval.py --unit heading --query-mode gated --rerank 10 40
 ```
 
 ## Layout
