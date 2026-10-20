@@ -41,47 +41,72 @@ Raw data is not committed; see `scripts/download_data.py`.
 Setup: 488 documents split into 13,421 section-level passages (heading path prepended). Each agent
 response is one evaluation point: the query is the preceding user utterance, the gold passage is the
 section holding the agent's grounding span. Validation split, 4,201 answerable turns. BM25 and dense
-(bge-m3) each return top 20; RRF with k = 60.
+(bge-m3) each return top 20; RRF with k = 60. 1,714 passages repeat another passage's text word for
+word; equal scores are broken by passage order so runs are deterministic.
 
 **Query construction.** Short follow-ups ("yes", "no, it was cancelled") answer the agent rather than ask
 something, and cannot be retrieved on their own; longer ones are usually self-contained, and adding
 history only dilutes them. So the query is the current utterance alone, plus the last two user/agent
-rounds (capped at 96 words, oldest dropped first) only when the utterance has at most 8 words. The
+rounds (capped at 96 words, oldest dropped first) only when the utterance has at most 7 words. The
 threshold was picked from 3–10 words by RRF Recall@5 on 4,000 sampled train turns
 (`scripts/select_gate.py`).
 
 | Retriever | Query | R@1 | R@5 | R@10 | R@20 | MRR@20 |
 |---|---|---|---|---|---|---|
 | BM25 | current utterance | 0.104 | 0.290 | 0.367 | 0.446 | 0.190 |
-| bge-m3 | current utterance | 0.097 | 0.318 | 0.403 | 0.484 | 0.193 |
-| RRF | current utterance | 0.132 | 0.356 | 0.430 | 0.502 | 0.231 |
-| BM25 | length-gated history | 0.135 | 0.362 | 0.448 | 0.537 | 0.238 |
-| bge-m3 | length-gated history | 0.137 | 0.403 | 0.499 | 0.591 | 0.253 |
-| **RRF** | **length-gated history** | **0.166** | **0.434** | **0.527** | **0.603** | **0.284** |
-| RRF | oracle gate (gold dialogue act; upper bound) | 0.173 | 0.443 | 0.529 | 0.612 | 0.292 |
-
-Single-query latency on a laptop (Apple M5 Pro): BM25 30 ms, bge-m3 24 ms with the gated query.
-
-Reproduce: `python scripts/eval_retrieval.py --split validation --query-mode last gated oracle`.
+| bge-m3 | current utterance | 0.092 | 0.316 | 0.401 | 0.483 | 0.190 |
+| RRF | current utterance | 0.131 | 0.353 | 0.429 | 0.502 | 0.229 |
+| BM25 | length-gated history | 0.134 | 0.363 | 0.446 | 0.536 | 0.237 |
+| bge-m3 | length-gated history | 0.129 | 0.396 | 0.492 | 0.583 | 0.246 |
+| **RRF** | **length-gated history** | **0.166** | **0.430** | **0.521** | **0.598** | **0.283** |
+| RRF | oracle gate (gold dialogue act; upper bound) | 0.173 | 0.440 | 0.528 | 0.611 | 0.291 |
 
 **Rerank.** bge-reranker-v2-m3 (cross-encoder, fp16 on MPS) reorders the top N of the RRF list; the rest
-of the list stays in place. Gated query, validation split.
+of the list stays in place. The cross-encoder gets the same gated query.
 
-| Reranked | R@1 | R@5 | R@10 | R@20 | MRR@20 | ms/query |
+| Query | Reranked | R@1 | R@5 | R@10 | R@20 | MRR@20 |
 |---|---|---|---|---|---|---|
-| none (RRF) | 0.166 | 0.434 | 0.527 | 0.603 | 0.284 | – |
-| top 10 | 0.207 | 0.488 | 0.527 | 0.603 | 0.330 | 61 |
-| top 20 | 0.212 | 0.512 | 0.576 | 0.603 | 0.342 | 135 |
-| **all candidates (≤ 40)** | **0.215** | **0.532** | **0.613** | **0.658** | **0.354** | 253 |
-| all, reranker query always with history | 0.208 | 0.523 | 0.611 | 0.657 | 0.344 | |
+| gated | none (RRF) | 0.166 | 0.430 | 0.521 | 0.598 | 0.283 |
+| gated | top 10 | 0.206 | 0.483 | 0.521 | 0.598 | 0.329 |
+| gated | top 20 | 0.211 | 0.509 | 0.570 | 0.598 | 0.341 |
+| **gated** | **all candidates (≤ 40)** | **0.215** | **0.531** | **0.611** | **0.654** | **0.354** |
+| gated, cross-encoder always given history | all | 0.209 | 0.521 | 0.607 | 0.653 | 0.344 |
+| current utterance | all | 0.180 | 0.453 | 0.519 | 0.558 | 0.299 |
 
 Reranking the whole candidate list is best on every metric, and it also lifts R@20 because RRF ranks some
 gold passages below 20. The cross-encoder does not remove the need for the gate: giving it the last two
-rounds for every turn helps replies (R@5 0.586 vs 0.576) but hurts questions (0.508 vs 0.522). Rerank is
-the most expensive retrieval stage, about 250 ms for 40 candidates (one query at a time, 100 queries) against ~50 ms for BM25 + dense.
+rounds for every turn lowers R@5 on questions from 0.525 to 0.510.
 
-Reproduce: `python scripts/eval_retrieval.py --query-mode gated --rerank 10 20 40` (add
-`--rerank-query recent:4` for the last row).
+**Department routing.** A MultiDoc2Dial dialogue stays in one domain, so the router reads the whole
+dialogue so far (current utterance first, oldest dropped past 256 words); the current utterance alone
+routes only 74.8% of held-out train turns correctly, against 97.9% for the dialogue. The router is
+logistic regression on bge-m3 embeddings (`scripts/train_router.py`). When its confidence clears a
+threshold, BM25 and dense search only that domain; otherwise everything. Thresholds were picked on 20% of
+train dialogues held out from fitting, separately for first turns (0.9: one utterance is little to go
+on, and a wrong domain removes the gold passage outright) and follow-ups (0.7).
+
+| Routing | RRF R@5 | + rerank R@1 | R@5 | R@10 | R@20 | MRR@20 | first-turn R@5 |
+|---|---|---|---|---|---|---|---|
+| none | 0.430 | 0.215 | 0.531 | 0.611 | 0.654 | 0.354 | 0.536 |
+| **router** | **0.449** | **0.224** | **0.549** | **0.632** | **0.681** | **0.368** | 0.532 |
+| gold domain (upper bound) | 0.456 | 0.227 | 0.558 | 0.642 | 0.692 | 0.373 | 0.558 |
+
+On validation the router restricts 89.6% of turns (60.2% of first turns) and picks the right domain for
+99.3% of them.
+
+**Latency** for one query at a time on a laptop (Apple M5 Pro), gated query: BM25 17 ms, bge-m3 17 ms,
+router 25 ms, rerank of 40 candidates about 250 ms (55 ms for 10, 128 ms for 20). Rerank is the most
+expensive retrieval stage.
+
+Reproduce:
+
+```
+python scripts/select_gate.py --split train
+python scripts/train_router.py
+python scripts/eval_retrieval.py --query-mode last gated oracle --rerank 10 20 40
+python scripts/eval_retrieval.py --query-mode gated --rerank 40 --rerank-query recent:4
+python scripts/eval_retrieval.py --query-mode gated --rerank 40 --route router   # or --route oracle
+```
 
 ## Layout
 

@@ -43,3 +43,19 @@ def test_rerank_scores_map_back_to_pairs():
     r.text = {"long": "x" * 30, "short": "x", "mid": "x" * 10}
     assert r.score_many([("q", "long"), ("q", "short"), ("q", "mid")]) == [30.0, 1.0, 10.0]
     assert r.rerank("q", ["short", "long", "mid"], top_n=2) == ["long", "mid"]
+
+
+def test_router_text_and_threshold():
+    import numpy as np
+
+    from vpqa.retrieval.route import DomainRouter, routing_text
+    from vpqa.schema import Turn
+
+    t = Turn("d", 3, "dmv", ["user: a b", "agent: c d"], "yes")
+    assert routing_text(t, "current") == "yes"
+    assert routing_text(t, "dialogue") == "yes agent: c d user: a b"
+    assert routing_text(t, "dialogue", max_words=3) == "yes agent: c"
+
+    emb = np.array([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]])
+    router = DomainRouter().fit(emb, ["dmv", "dmv", "va", "va"])
+    assert router.route(np.array([[1.0, 0.0], [0.5, 0.5]]), threshold=0.55) == ["dmv", None]
