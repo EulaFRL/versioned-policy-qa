@@ -64,6 +64,25 @@ Single-query latency on a laptop (Apple M5 Pro): BM25 30 ms, bge-m3 24 ms with t
 
 Reproduce: `python scripts/eval_retrieval.py --split validation --query-mode last gated oracle`.
 
+**Rerank.** bge-reranker-v2-m3 (cross-encoder, fp16 on MPS) reorders the top N of the RRF list; the rest
+of the list stays in place. Gated query, validation split.
+
+| Reranked | R@1 | R@5 | R@10 | R@20 | MRR@20 | ms/query |
+|---|---|---|---|---|---|---|
+| none (RRF) | 0.166 | 0.434 | 0.527 | 0.603 | 0.284 | – |
+| top 10 | 0.207 | 0.488 | 0.527 | 0.603 | 0.330 | 61 |
+| top 20 | 0.212 | 0.512 | 0.576 | 0.603 | 0.342 | 135 |
+| **all candidates (≤ 40)** | **0.215** | **0.532** | **0.613** | **0.658** | **0.354** | 253 |
+| all, reranker query always with history | 0.208 | 0.523 | 0.611 | 0.657 | 0.344 | |
+
+Reranking the whole candidate list is best on every metric, and it also lifts R@20 because RRF ranks some
+gold passages below 20. The cross-encoder does not remove the need for the gate: giving it the last two
+rounds for every turn helps replies (R@5 0.586 vs 0.576) but hurts questions (0.508 vs 0.522). Rerank is
+the most expensive retrieval stage, about 250 ms for 40 candidates (one query at a time, 100 queries) against ~50 ms for BM25 + dense.
+
+Reproduce: `python scripts/eval_retrieval.py --query-mode gated --rerank 10 20 40` (add
+`--rerank-query recent:4` for the last row).
+
 ## Layout
 
 ```

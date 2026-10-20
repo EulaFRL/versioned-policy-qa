@@ -10,6 +10,7 @@ retrieval:
   top_n: 5
 rerank:
   model: BAAI/bge-reranker-v2-m3
-  enabled: false
+  enabled: true
+  candidates: 40      # whole RRF list (bm25_k + dense_k, deduplicated); same gated query as retrieval
 verifier:
   enabled: false
