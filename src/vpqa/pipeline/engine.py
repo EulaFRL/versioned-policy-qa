@@ -137,7 +137,9 @@ class Graph:
                 raise ContractError(f"given input {key!r} missing or not {tp}")
         state = dict(values)
         trace = Trace()
-        trace.add(node="<given>", status="ok", ms=0.0, outputs=summarize(values))
+        # the inputs in full, so a run can be replayed from its trace (scripts/replay_trace.py)
+        trace.add(node="<given>", status="ok", ms=0.0, full=True,
+                  outputs={k: asdict(v) if is_dataclass(v) else v for k, v in values.items()})
         deadline = None if budget_s is None else time.perf_counter() + budget_s
         for node in self.nodes:
             if node.skip_if is not None and state[node.skip_if]:
