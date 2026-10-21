@@ -29,16 +29,20 @@ class DenseIndex:
     def encode(self, texts: list[str]) -> np.ndarray:
         return self.model.encode(texts, normalize_embeddings=True, batch_size=64)
 
-    def search_many(self, queries: list[str], k: int = 20,
-                    domains: list[str | None] | None = None) -> list[list[str]]:
-        """Top k passages per query; `domains[i]` restricts query i to one domain (None: no filter)."""
+    def search_many(self, queries: list[str], k: int = 20, domains: list[str | None] | None = None,
+                    masks: list[np.ndarray | None] | None = None) -> list[list[str]]:
+        """Top k passages per query; `domains[i]` restricts query i to one domain and `masks[i]` to the
+        passages where it is true (None: no filter)."""
         scores = self.encode(queries) @ self.emb.T
-        if domains is not None:
-            for i, d in enumerate(domains):
-                if d is not None:
-                    scores[i, self.domains != d] = -np.inf
+        for i, d in enumerate(domains or []):
+            if d is not None:
+                scores[i, self.domains != d] = -np.inf
+        for i, m in enumerate(masks or []):
+            if m is not None:
+                scores[i, ~m] = -np.inf
         top = np.argsort(-scores, axis=1, kind="stable")[:, :k]
-        return [[self.pids[i] for i in row] for row in top]
+        return [[self.pids[j] for j in row if np.isfinite(scores[i, j])] for i, row in enumerate(top)]
 
-    def search(self, query: str, k: int = 20, domain: str | None = None) -> list[str]:
-        return self.search_many([query], k, [domain])[0]
+    def search(self, query: str, k: int = 20, domain: str | None = None,
+               mask: np.ndarray | None = None) -> list[str]:
+        return self.search_many([query], k, [domain], [mask])[0]

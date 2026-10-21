@@ -16,5 +16,9 @@ rerank:
   model: BAAI/bge-reranker-v2-m3
   enabled: true
   candidates: 40      # whole RRF list (bm25_k + dense_k, deduplicated); same gated query as retrieval
+harness:
+  # per-stage budgets, about 1.3-2x the p95 latency on 50 MultiDoc2Dial turns and eCFR dev (scripts/check_dag.py);
+  # on timeout: route -> search all domains, retrieve -> BM25 only, rerank -> keep the RRF order
+  timeouts_ms: {route: 150, retrieve: 300, rerank: 1500}
 verifier:
   enabled: false

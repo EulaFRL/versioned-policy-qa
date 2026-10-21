@@ -20,10 +20,14 @@ class BM25Index:
         self.domains = np.array([p.domain for p in passages])
         self.bm25 = BM25Okapi([tokenize(p.text) for p in passages])
 
-    def search(self, query: str, k: int = 20, domain: str | None = None) -> list[str]:
-        """Top k passages, restricted to one domain when `domain` is given."""
+    def search(self, query: str, k: int = 20, domain: str | None = None,
+               mask: np.ndarray | None = None) -> list[str]:
+        """Top k passages, restricted to one domain when `domain` is given and to the passages where
+        `mask` is true when it is given."""
         scores = self.bm25.get_scores(tokenize(query))
         if domain is not None:
             scores = np.where(self.domains == domain, scores, -np.inf)
+        if mask is not None:
+            scores = np.where(mask, scores, -np.inf)
         order = np.argsort(-scores, kind="stable")[:k]
-        return [self.pids[i] for i in order]
+        return [self.pids[i] for i in order if np.isfinite(scores[i])]
