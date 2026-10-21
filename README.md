@@ -14,11 +14,15 @@ separately.
 ## Pipeline
 
 ```
-query ─▶ rewrite (coreference, aliases) ─▶ route (department) ─▶ hybrid retrieve (BM25 + dense, RRF)
-      ─▶ rerank ─▶ version filter (effective date) ─▶ answer ─▶ verifier (claim ↔ span) ─▶ answer | refuse
+query ─▶ route (department) ─▶ corpus filter (effective date) ─▶ hybrid retrieve (BM25 + dense, RRF)
+      ─▶ rerank ─▶ cited answer ─▶ verifier (format, version, support) ─▶ revise ≤ 2 ─▶ answer | refuse | passages
 ```
 
-Each stage is a plain function with typed inputs/outputs so it can be ablated on its own.
+The pipeline is a fixed DAG (`src/vpqa/pipeline/engine.py`, `dag.py`): each node declares typed inputs
+and outputs, checked when the graph is built and at run time, and has a time budget and a fallback
+(route → all departments, retrieve → BM25 only, rerank → fused order, answer and verify → show the top
+passages). The revision loop is unrolled into fixed nodes that are skipped once an answer passes. Every
+run writes a JSONL trace: the full inputs, then per node its status, latency and outputs.
 
 ## Data
 
@@ -35,10 +39,12 @@ version-conflict questions are committed in `data/benchmark/`: `ecfr_version_qa.
 
 - Retrieval: Recall@k, MRR against gold grounding sections; Hit@k and Ctx@W (gold text within a word
   budget) when comparing retrieval units
-- Citation accuracy (planned): answer cites a span that overlaps gold
+- Citation accuracy: Cite-Hit, the answer cites a gold passage; Cite-Prec, the share of cited passages
+  that are gold
 - Version accuracy: on the eCFR version-conflict questions, R@k of the version in force on the question's
   date, plus how often a stale or not-yet-effective version is retrieved instead
-- Refusal (planned): precision/recall of refusing on unanswerable turns
+- Refusal: precision/recall of refusing, on the same turns made unanswerable by withholding their gold
+  documents
 
 ### Retrieval on MultiDoc2Dial
 
@@ -215,6 +221,177 @@ python scripts/build_ecfr.py
 python scripts/make_version_qa.py          # needs VPQA_API_BASE / VPQA_API_KEY / VPQA_MODEL
 python scripts/eval_versions.py --split dev --rerank \
     --policy unaware latest prefilter postfilter:20 prefilter:100 postfilter:100
+```
+
+### Cited answers on MultiDoc2Dial
+
+The answer model sees the top 5 reranked passages (each cut to 400 words) and the last 4 utterances, and
+must end every sentence with the passages it relies on, or reply NOT_FOUND. The verifier checks the
+format, that every cited version is in force on the question's date, and, in one LLM call, that each
+claim is supported by the passages it cites. A rejected answer is rewritten with the verifier's problems,
+at most twice; if none passes, the top passages are shown instead. claude-sonnet-5.5 for answer and
+verifier, temperature 0.
+
+300 validation turns (seed 0), all answerable:
+
+| | Value |
+|---|---|
+| Answered / refused / passages shown | 0.833 / 0.167 / 0 |
+| Cite-Hit (final answers) | 0.552 |
+| Cite-Hit when a gold passage is in the top 5 | 0.868 |
+| Gold passage in the top 5 | 0.540 |
+| Refused although a gold passage was in the top 5 | 0.019 |
+| Cite-Prec | 0.300 |
+| First answers rejected by the verifier / passed after one or two rewrites | 25 / 24 + 1 |
+| Stage fallbacks | 0 |
+| Latency p50 / p95 (end to end) | 6.4 s / 15.4 s |
+| API cost | 1.73 USD (0.006 per turn) |
+
+Retrieval is the bottleneck: when a gold passage is shown, the answer cites it 87% of the time; 8 of
+the 21 misses cite another passage of the gold document. The verifier changes little here (first-answer
+Cite-Hit 0.556): of the 25 rejected answers, 16 had a claim the cited passage does not support (an
+overstatement, or a conclusion about the user's case), 8 an uncited sentence, usually a remark on what
+the passages leave out, and 1 a verifier reply that could not be parsed; rewriting fixes the wording
+but leaves the evidence as it was (10 of the 25 cited a gold passage before the rewrite, 9 after).
+
+### Refusal
+
+Unanswerable turns are made from the same 300: every passage of the documents holding a gold passage is
+masked out of retrieval for that turn (`--withhold gold-doc`; masked, not removed, so BM25 statistics do
+not change). Withholding a document does not always make a turn unanswerable, because MultiDoc2Dial pages
+overlap. An LLM judge given the conversation, the gold grounding text and the top 5 passages retrieved
+without the gold document found 109 of 300 withheld turns still answerable (`scripts/judge_withheld.py`,
+0.84 USD); those pairs are dropped below.
+
+191 pairs (answerable turn and its withheld twin):
+
+| Declined | P | R | F1 |
+|---|---|---|---|
+| First answer (no verifier) | 0.664 | 0.466 | 0.548 |
+| Final output (verifier, rewrites) | 0.667 | 0.471 | 0.552 |
+
+Of the 191 unanswerable turns, 102 get a first answer, the verifier passes 79 of them unchanged, and 101
+end answered. The verifier checks that
+each claim is supported by the passages cited, not that the passages answer the question, so an answer
+about a neighbouring topic passes.
+
+A refusal gate on the best rerank score (refuse before the LLM call when it is below a threshold) does
+not help. On 1,000 train pairs and on validation the score separates answerable from withheld turns only
+weakly (AUROC 0.67 and 0.63), and the threshold that maximises the gate's refusal F1 on train (0.996)
+leaves only 15% of validation turns answered. The gate is implemented (`answer.min_score`) but off;
+`scripts/select_refusal_gate.py` gives the full coverage–accuracy curve.
+
+### Stale versions at answer time (eCFR)
+
+100 dev items, three ways a version not in force on the question's date can reach the answer model:
+`filter`, the pipeline as configured (retrieval keeps only versions in force); `unaware`, retrieval over
+all versions; `inject`, as `filter`, then another version of the gold paragraph that is not in force is
+put first among the 5 passages shown. The answer prompt does not show the question's date; the verifier
+checks every cited version against it.
+
+| Versions | First answer cites a version not in force | Of those, rejected | Final cites one | Final Cite-Hit | Answered / refused / passages | Latency p50 / p95 | Cost per item |
+|---|---|---|---|---|---|---|---|
+| filter | 0 | – | 0 | 0.958 | 0.95 / 0.05 / 0 | 6.2 s / 12.4 s | 0.009 USD |
+| unaware | 0.897 | 1.00 | 0.022 | 0.888 | 0.81 / 0.11 / 0.08 | 13.0 s / 27.1 s | 0.018 USD |
+| inject | 0.909 | 1.00 | 0.011 | 0.947 | 0.90 / 0.05 / 0.05 | 15.3 s / 28.1 s | 0.019 USD |
+
+Shown a stale version, the model cites it in about 90% of answers, usually next to the right one. The
+verifier's date check rejects every one of them, and the rewrite drops the stale citation in all but 1–2%
+of items; the price is one or two extra LLM rounds (twice the latency and cost) and 5–8% of items
+falling back to passage text. Filtering at retrieval avoids all of that, so the verifier's version check
+is a safety net, not the mechanism.
+
+### Fixed DAG vs a ReAct agent
+
+Control group (`src/vpqa/pipeline/react.py`): the same model and the same retrieval and rerank, exposed
+as a `search(query, department)` tool; the model decides whether, what and where to search, at most 4
+times, then answers under the same citation rules. No verifier inside the loop; afterwards each ReAct
+answer is checked once by the DAG's verifier, only to measure support. First 100 of the 300 turns, and
+the same 100 with gold documents withheld.
+
+| 100 answerable turns | Answered | Cite-Hit | Cite-Prec | Verifier pass | Searches | Latency p50 / p95 | Cost per turn |
+|---|---|---|---|---|---|---|---|
+| DAG, final | 0.780 | 0.603 | 0.327 | 0.910 (first answer) | 1 | 6.1 s / 13.7 s | 0.006 USD (with verifier) |
+| ReAct | 0.960 | 0.417 | 0.237 | 0.802 | 1.59 | 7.2 s / 12.9 s | 0.009 USD (without) |
+
+| 68 truly unanswerable pairs | Refusal P | R | F1 |
+|---|---|---|---|
+| DAG, final | 0.642 | 0.500 | 0.562 |
+| ReAct | 0.800 | 0.235 | 0.364 |
+
+The agent always searches (never answers from memory), never repeats a query, and when it names a
+department (70% of searches) it is always the dialogue's own. Its searches are as good as the DAG's: a
+gold passage is among what it sees on 55 of 100 turns, against 52 in the DAG's top 5, although it
+rewrites every message into its own query and sees 7.4 passages per turn. The gap is in answering: given
+a gold passage it cites it less often (0.77 against 0.94 on answered turns), and it answers almost every
+turn, including those where nothing relevant was found, so it refuses half as many unanswerable ones and
+its answers pass the verifier less often. The fixed query, the fixed top 5 and the verifier keep the DAG
+answer close to its evidence; the agent's freedom to search more does not buy better evidence here.
+
+### Searching each department when the router is unsure
+
+When the router's confidence is below its threshold the pipeline searches all departments in one index.
+The alternative (`route.fan_out`, off by default): search each department in its own thread with its own
+250 ms budget, fuse BM25 and dense per department, fuse the departments, rerank. Validation, the 439 of
+4,201 answerable turns the router leaves unrouted, every list reranked in full:
+
+| Search | R@1 | R@5 | R@10 | MRR@20 | Candidates | Retrieve p50 | Rerank p50 | Departments over budget |
+|---|---|---|---|---|---|---|---|---|
+| one global search | 0.126 | **0.486** | **0.577** | **0.280** | 35 | 28 ms | 162 ms | – |
+| per department, top 5 each | 0.130 | 0.450 | 0.475 | 0.258 | 37 | 99 ms | 182 ms | 10 |
+| per department, top 10 each | 0.124 | 0.476 | 0.563 | 0.272 | 73 | 100 ms | 309 ms | 11 |
+| gold department only (upper bound) | 0.139 | 0.526 | 0.632 | 0.305 | 33 | 29 ms | 170 ms | – |
+
+Per-department search is slower and no better than one global search, and even searching only the
+right department gains just 4 points of R@5 on these turns: what the router misses costs little. It
+stays off.
+
+### Stage budgets under pressure
+
+The same 300 turns through the retrieval stages only, with every stage budget (route 150 ms, retrieve
+300 ms, rerank 1,500 ms) multiplied by a factor; on CPU, the models moved off the GPU. A stage over
+budget falls back (route → all departments, retrieve → BM25, rerank → fused order). A stage that times
+out keeps running in its thread and holds the model lock, so the next stage can find the lock taken;
+that cost is part of what is measured (`scripts/eval_budgets.py`).
+
+| Device, budget | Route fell back | Retrieve | Rerank | R@1 | R@5 | MRR@20 | Latency p50 / p95 |
+|---|---|---|---|---|---|---|---|
+| GPU (MPS), no budgets | 0 | 0 | 0 | 0.212 | 0.540 | 0.353 | 278 / 538 ms |
+| GPU, × 1 (configured) | 0 | 0 | 0 | 0.212 | 0.540 | 0.353 | 278 / 538 ms |
+| GPU, × 0.5 | 0.003 | 0.003 | 0 | 0.212 | 0.540 | 0.353 | 278 / 538 ms |
+| GPU, × 0.25 | 0.140 | 0.093 | 0.077 | 0.212 | 0.520 | 0.346 | 277 / 475 ms |
+| GPU, × 0.1 | 0.843 | 0.707 | 0.537 | 0.170 | 0.433 | 0.283 | 221 / 308 ms |
+| CPU, no budgets | 0 | 0 | 0 | 0.212 | 0.540 | 0.354 | 2,856 / 6,544 ms |
+| CPU, × 1 | 0.903 | 0.830 | 0.910 | 0.157 | 0.383 | 0.258 | 1,994 / 2,041 ms |
+| CPU, × 0.5 | 1.000 | 0.997 | 1.000 | 0.143 | 0.363 | 0.246 | 1,024 / 1,072 ms |
+
+On the hardware they were set for, the budgets never fire, and they have room: halved, nothing changes;
+at a quarter, 8–14% of turns fall back at each stage and R@5 drops 2 points. On CPU, where retrieval
+takes 3–6 s, the same budgets hold every turn to about 2 s (their sum is 1.95 s) and nearly every stage
+falls back; the ranking then comes from BM25 alone, at R@5 0.38 instead of 0.54. Without budgets the
+fallbacks would never run and the CPU p95 would be 6.5 s.
+
+### Replaying a run from its trace
+
+`scripts/replay_trace.py <trace> <run_id>` rebuilds the turn from the trace's first record, runs it
+again without budgets (LLM replies come from the response cache, so it costs nothing when no prompt
+changed), and compares every node's outputs with the recorded ones: a node marked DIFFERENT is where
+code, index or prompt changed since the run; a node that timed out shows what it would have returned.
+
+Reproduce (generation needs VPQA_API_BASE / VPQA_API_KEY / VPQA_MODEL; about 11 USD in all):
+
+```
+python scripts/eval_answers.py --dataset md2d --n 300
+python scripts/eval_answers.py --dataset md2d --n 300 --withhold gold-doc
+python scripts/judge_withheld.py runs/answers/md2d_validation_n300_s0_withheld.jsonl
+python scripts/refusal_report.py runs/answers/md2d_validation_n300_s0.jsonl \
+    runs/answers/md2d_validation_n300_s0_withheld.jsonl \
+    --covered runs/answers/md2d_validation_n300_s0_withheld.covered.json
+python scripts/select_refusal_gate.py --train-n 1000
+python scripts/eval_answers.py --dataset ecfr --split dev --n 100 --versions filter   # or unaware / inject
+python scripts/eval_react.py --n 100                        # and --withhold gold-doc
+python scripts/eval_fanout.py --k 5 10
+python scripts/eval_budgets.py --n 300                      # and --device cpu --scale none 1 0.5
 ```
 
 ## Layout
