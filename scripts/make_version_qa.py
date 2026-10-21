@@ -1,7 +1,8 @@
 """Build the version-conflict question set from amended eCFR passages.
 
-For a pair of consecutive versions of one passage, an LLM writes a question whose answer changed with the
-amendment. The question is kept only if each version, given alone, answers it and the two answers differ
+For a pair of consecutive versions of one passage, an LLM first checks that both are the same provision
+(paragraphs get relettered, so one label can hold unrelated rules over time), then writes a question whose
+answer changed with the amendment. The question is kept only if each version, given alone, answers it and the two answers differ
 in substance (two more LLM calls and a judge). A kept question yields two items, one dated inside each
 version's validity window; the gold passage is the version in force on that date. Splits are by section.
 """
@@ -32,12 +33,15 @@ NEW (in force from {new_from}):
 
 Write one question a member of the public might ask whose correct answer under OLD differs from its correct
 answer under NEW because of this amendment.
-- Each version alone must be enough to answer it.
+- Ask about something BOTH versions state explicitly but differently (an amount, a deadline or period, an
+  age, a condition, who decides, a required step). Each version alone must answer it. Do not ask about a
+  provision that only one version contains.
 - Do not mention versions, dates of amendment, "old"/"new", "currently", or section or paragraph numbers.
 - Make it self-contained (name the program or benefit) and phrase it as a real person would, in one sentence.
-- If the amendment does not change what any question would be answered with (renumbering, cross-reference
-  or editorial changes), return {{"skip": true}}.
-Return only JSON: {{"question": "...", "answer_old": "...", "answer_new": "..."}} with short answers."""
+- If no such question exists (the amendment only adds or removes a provision, or is a renumbering,
+  cross-reference or editorial change), return {{"skip": true}}.
+Reply with the JSON object only, no other text: {{"question": "...", "answer_old": "...", "answer_new": "..."}},
+with short answers."""
 
 ANSWER = """Answer the question using only the regulation text below. Answer in one or two sentences. If the text does
 not answer the question, answer exactly NOT_ANSWERED.
@@ -47,7 +51,20 @@ Text:
 
 Question: {question}
 
-Return only JSON: {{"answer": "..."}}"""
+Reply with the JSON object only, no other text: {{"answer": "..."}}"""
+
+SAME = """Below are two consecutive texts found under the same paragraph label of a U.S. federal regulation.
+
+OLD:
+{old}
+
+NEW:
+{new}
+
+Is NEW an amended version of the same provision as OLD (same subject, with some rules changed), or a different
+provision that now sits under the same label (for example after paragraphs were renumbered, or the paragraph was
+replaced by a rule on another subject)?
+Reply with the JSON object only, no other text: {{"same_provision": true}} or {{"same_provision": false}}"""
 
 JUDGE = """Question: {question}
 Answer A: {a}
@@ -55,7 +72,7 @@ Answer B: {b}
 
 Do A and B give materially different answers (a different amount, date, period, condition, eligibility rule,
 requirement or procedure)? Differences in wording alone do not count.
-Return only JSON: {{"different": true}} or {{"different": false}}"""
+Reply with the JSON object only, no other text: {{"different": true}} or {{"different": false}}"""
 
 
 def changed_words(old: str, new: str) -> int:
@@ -91,8 +108,12 @@ def body(p: Passage) -> str:
 
 
 def make_items(old: Passage, new: Passage) -> dict:
+    same = llm.chat_json([{"role": "user", "content": SAME.format(old=body(old), new=body(new))}]) or {}
+    if same.get("same_provision") is not True:
+        return {"status": "different_provision"}
     q = llm.chat_json([{"role": "user", "content": GEN.format(
-        old_from=old.effective_from, old_to=old.effective_to, old=old.text, new_from=new.effective_from, new=new.text)}])
+        old_from=old.effective_from, old_to=old.effective_to, old=old.text, new_from=new.effective_from, new=new.text)}],
+        max_tokens=1500)
     if not q or q.get("skip") or not q.get("question"):
         return {"status": "skipped_by_generator"} if q else {"status": "bad_json"}
     question = q["question"].strip()
@@ -115,9 +136,9 @@ def as_of_in(p: Passage, rng: random.Random, today: date) -> date:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--versions", type=Path, default=Path("data/processed/ecfr_versions.jsonl"))
-    ap.add_argument("--out", type=Path, default=Path("data/processed/ecfr_version_qa.jsonl"))
-    ap.add_argument("--per-domain", type=int, default=150, help="pairs sent to the generator per domain")
-    ap.add_argument("--per-section", type=int, default=2, help="pairs per section, from different paragraphs")
+    ap.add_argument("--out", type=Path, default=Path("data/benchmark/ecfr_version_qa.jsonl"))
+    ap.add_argument("--per-domain", type=int, help="cap on pairs sent to the generator per domain")
+    ap.add_argument("--per-section", type=int, help="cap on pairs per section")
     ap.add_argument("--min-changed", type=int, default=3)
     ap.add_argument("--min-words", type=int, default=25)
     ap.add_argument("--dev-share", type=float, default=0.5)
@@ -133,9 +154,10 @@ def main() -> None:
     rng = random.Random(args.seed)
     rng.shuffle(pairs)
     chosen, per_section, keys = defaultdict(list), Counter(), set()
-    for old, new in pairs:  # one pair per paragraph and few per section, so questions do not repeat one rule
+    for old, new in pairs:  # one pair per paragraph, so no two questions come from the same rule text
         key = old.pid.split("@")[0]
-        if key in keys or per_section[old.doc_id] >= args.per_section or len(chosen[old.domain]) >= args.per_domain:
+        if (key in keys or (args.per_section and per_section[old.doc_id] >= args.per_section)
+                or (args.per_domain and len(chosen[old.domain]) >= args.per_domain)):
             continue
         keys.add(key)
         per_section[old.doc_id] += 1

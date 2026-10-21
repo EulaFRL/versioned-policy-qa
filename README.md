@@ -25,16 +25,19 @@ Each stage is a plain function with typed inputs/outputs so it can be ablated on
 | Source | Use | Notes |
 |---|---|---|
 | [MultiDoc2Dial](https://doc2dial.github.io/multidoc2dial/) | multi-turn, multi-document dialogues with gold grounding spans | 4 domains; used for routing, follow-up rewriting, citation accuracy |
-| [eCFR point-in-time API](https://www.ecfr.gov/developers/documentation/api/v1) | multiple dated versions of the same regulation | used to build the version-conflict test split |
+| [eCFR point-in-time API](https://www.ecfr.gov/developers/documentation/api/v1) | multiple dated versions of the same regulation | 20 CFR 404/416, 38 CFR 3, 34 CFR 668/685 (the regulations behind three MultiDoc2Dial domains); used to build the version-conflict questions |
 
-Raw data is not committed; see `scripts/download_data.py`.
+Raw data is not committed; see `scripts/download_data.py` and `scripts/build_ecfr.py`. The eCFR
+version-conflict questions are committed in `data/benchmark/`: `ecfr_version_qa.jsonl` holds the items,
+`ecfr_version_qa.log.jsonl` the outcome of every candidate pair, including the rejected ones.
 
 ## Evaluation
 
 - Retrieval: Recall@k, MRR against gold grounding sections; Hit@k and Ctx@W (gold text within a word
   budget) when comparing retrieval units
 - Citation accuracy (planned): answer cites a span that overlaps gold
-- Version accuracy (planned): on the version split, cites the version effective on the query date
+- Version accuracy: on the eCFR version-conflict questions, R@k of the version in force on the question's
+  date, plus how often a stale or not-yet-effective version is retrieved instead
 - Refusal (planned): precision/recall of refusing on unanswerable turns
 
 ### Retrieval on MultiDoc2Dial
@@ -149,6 +152,69 @@ python scripts/eval_retrieval.py --query-mode gated --rerank 40 --rerank-query r
 python scripts/eval_retrieval.py --query-mode gated --rerank 40 --route router   # or --route oracle
 python scripts/eval_retrieval.py --unit heading --query-mode history                # or --unit token / section
 python scripts/eval_retrieval.py --unit heading --query-mode gated --rerank 10 40
+```
+
+### Version-aware retrieval on eCFR
+
+**Corpus.** For each of the five parts, eCFR's point-in-time API is queried on every date a section
+changed in substance, from 2016-12-19 (the earliest date it serves) to 2026-08-31: 215 snapshots. Each
+section is cut at its top-level paragraphs (a), (b), ...; paragraphs over 250 words are cut further at
+(1), (2), ... or, for definition lists, at each definition. A passage is keyed by its labels or the
+definition's first words, never by position, so inserting a paragraph does not turn the ones after it
+into new versions. Consecutive snapshots with the same text under a key form one version, valid from the
+first snapshot date until the date the text changes; changes in typesetting only (dash and spacing
+re-renders) do not count. Result: 12,483 passage versions, 1,437 paragraphs with more than one.
+
+**Questions.** From each amended paragraph (at least 25 words, at least 3 changed words) one pair of
+consecutive versions is sampled, 1,012 pairs in all. An LLM first checks that the two texts are the same
+provision: when paragraphs are relettered, one label can hold unrelated rules over time. It then writes
+a question that both versions answer explicitly but differently, or declines. The question is kept only
+if each version, given alone, answers it and a judge finds the two answers materially different.
+Outcomes: different provision 165, declined 324, kept 277, a version could not answer 165, same answer
+52, malformed generator output 29 (discarded). Each kept question gives two items, dated inside each
+version's validity window, whose gold passage is the version in force on that date. Splits are by
+section: dev 135 questions (270 items, 89 sections), test 142 questions (284 items, 84 sections). All
+LLM steps use claude-sonnet-5.5 at temperature 0; the set cost about 9 USD including pilot runs. The
+test split is held out until the end of the project.
+
+**Spot check.** 30 questions drawn at random before the same-provision check was added were read against
+both texts. The check removes the 3 that compare unrelated rules. Of the other 27, two questions give
+the change away in their wording and one answer adds text both versions share; none has a wrong gold
+version.
+
+**Policies.** `unaware`: one index over all versions, date ignored. `latest`: only versions in force
+today. `prefilter`: retrieve among versions in force on the question's date. `postfilter:N`: retrieve
+top N over all versions, then drop those not in force. BM25 and bge-m3 each return 20 (or N), fused
+with RRF and reranked by bge-reranker-v2-m3. Key@5: any version of the gold paragraph in the top 5.
+Stale@1: the top passage is another version of the gold paragraph. Invalid@5: share of the top 5 not
+in force on the question's date.
+
+Dev split, 270 items, RRF + rerank:
+
+| Policy | R@1 | R@5 | R@10 | Key@5 | Stale@1 | Invalid@5 | R@1 old | R@1 new |
+|---|---|---|---|---|---|---|---|---|
+| unaware | 0.293 | 0.819 | 0.900 | 0.911 | 0.293 | 0.505 | 0.267 | 0.319 |
+| latest | 0.248 | 0.407 | 0.419 | 0.889 | 0.293 | 0.399 | 0.000 | 0.496 |
+| prefilter | **0.581** | 0.915 | 0.937 | 0.915 | 0 | 0 | 0.600 | 0.563 |
+| postfilter:20 | 0.578 | 0.911 | 0.926 | 0.911 | 0 | 0 | 0.600 | 0.556 |
+| prefilter, depth 100 | **0.581** | **0.937** | **0.959** | 0.937 | 0 | 0 | 0.600 | 0.563 |
+| postfilter:100 | **0.581** | **0.937** | **0.959** | 0.937 | 0 | 0 | 0.600 | 0.563 |
+
+Without the date the retriever still finds the right paragraph (Key@5 0.911) but picks the wrong
+version as often as the right one: Stale@1 equals R@1. Filtering by date doubles R@1. Keeping only the
+current text fails every question dated in the past and also loses on many "new" questions, because
+that version was itself amended later. Filtering before or after retrieval makes no difference at equal
+depth, since only two or three versions of a paragraph compete; postfilter:20 loses a little at R@10
+because some of its 20 candidates are dropped. Without the reranker, prefilter reaches R@1 0.433 and
+unaware 0.200.
+
+Reproduce:
+
+```
+python scripts/build_ecfr.py
+python scripts/make_version_qa.py          # needs VPQA_API_BASE / VPQA_API_KEY / VPQA_MODEL
+python scripts/eval_versions.py --split dev --rerank \
+    --policy unaware latest prefilter postfilter:20 prefilter:100 postfilter:100
 ```
 
 ## Layout

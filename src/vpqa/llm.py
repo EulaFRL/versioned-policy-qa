@@ -28,18 +28,23 @@ def chat(messages: list[dict], temperature: float = 0.0, max_tokens: int = 800, 
         return json.loads(path.read_text())["content"]
     base = os.environ["VPQA_API_BASE"].rstrip("/")
     headers = {"Authorization": f"Bearer {os.environ['VPQA_API_KEY']}"}
+    content = None
     for attempt in range(6):
         try:
             r = httpx.post(f"{base}/chat/completions", json=body, headers=headers, timeout=120)
             if r.status_code == 429 or r.status_code >= 500:
                 raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
             r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
-            break
+            content = r.json()["choices"][0]["message"].get("content")
+            if content:
+                break
         except (httpx.TransportError, httpx.HTTPStatusError) as e:
-            if attempt == 5 or (isinstance(e, httpx.HTTPStatusError) and e.response.status_code not in (429,) and e.response.status_code < 500):
+            if attempt == 5 or (isinstance(e, httpx.HTTPStatusError) and e.response.status_code != 429
+                                and e.response.status_code < 500):
                 raise
-            time.sleep(2 ** attempt)
+        time.sleep(2 ** attempt)
+    if not content:  # empty replies are not cached, so a rerun tries again
+        return ""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"request": body, "content": content}))
     return content

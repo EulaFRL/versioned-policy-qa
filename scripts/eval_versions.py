@@ -8,7 +8,8 @@ date, and the other versions of that paragraph are its stale (or not yet in forc
 Version policies:
 - `unaware`: one index over all versions, the date is ignored;
 - `latest`: index only the versions in force today (what a system that keeps the current text does);
-- `prefilter`: BM25 and dense search only the versions in force on the as-of date;
+- `prefilter[:N]`: BM25 and dense each return their top N (default 20) among the versions in force on
+  the as-of date;
 - `postfilter:N`: each retriever returns its top N over all versions, then versions not in force are dropped.
 
 Metrics: R@k (gold version in the top k), Key@k (any version of the gold paragraph in the top k),
@@ -60,7 +61,7 @@ def score(runs: list[list[str]], items: list[dict], valid: dict[str, set[str]]) 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--qa", type=Path, default=Path("data/processed/ecfr_version_qa.jsonl"))
+    ap.add_argument("--qa", type=Path, default=Path("data/benchmark/ecfr_version_qa.jsonl"))
     ap.add_argument("--versions", type=Path, default=Path("data/processed/ecfr_versions.jsonl"))
     ap.add_argument("--split", default="dev")
     ap.add_argument("--policy", nargs="+", default=["unaware", "latest", "prefilter", "postfilter:20", "postfilter:100"])
@@ -94,7 +95,7 @@ def main() -> None:
             elif name == "latest":
                 mask, depth = current, DEPTH
             elif name == "prefilter":
-                mask, depth = valid_masks[i], DEPTH
+                mask, depth = valid_masks[i], int(n or DEPTH)
             elif name == "postfilter":
                 mask, depth = None, int(n)
             else:
@@ -115,7 +116,8 @@ def main() -> None:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{args.split}{'_rerank' if args.rerank else ''}.json").write_text(json.dumps(results, indent=2))
+    name = "_".join([args.split, *(p.replace(":", "") for p in args.policy)] + (["rerank"] if args.rerank else []))
+    (out / f"{name}.json").write_text(json.dumps(results, indent=2))
     cols = [f"R@{k}" for k in KS] + ["Key@5", "Stale@1", "Invalid@5"]
     print("| policy / retriever | " + " | ".join(cols) + " | old R@1 | new R@1 |")
     print("|---" * (len(cols) + 3) + "|")
