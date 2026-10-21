@@ -87,3 +87,18 @@ def test_span_recall_within_budget():
     span_pids = {"s1": ["a"], "s2": ["c"]}
     assert span_recall_within(["a", "c", "b"], ["s1", "s2"], span_pids, words, 200) == 1.0
     assert span_recall_within(["a", "b", "c"], ["s1", "s2"], span_pids, words, 200) == 0.5  # stops at b
+
+
+def test_withhold_gold_docs_hides_every_passage_of_the_gold_document():
+    from vpqa.eval.refusal import withhold_gold_docs
+    from vpqa.schema import Passage, Turn
+    by_pid = {p.pid: p for p in [Passage("a1", "A", "x", ""), Passage("a2", "A", "x", ""), Passage("b1", "B", "x", "")]}
+    [t] = withhold_gold_docs([Turn("d", 1, "x", [], "q", gold_pids=["a2"])], by_pid)
+    assert sorted(t.withheld) == ["a1", "a2"] and not t.answerable
+
+
+def test_best_threshold_and_coverage():
+    from vpqa.eval.refusal import best_threshold, coverage_accuracy
+    t, f1 = best_threshold([0.9, 0.8, 0.1, 0.2], [False, False, True, True])
+    assert 0.2 < t <= 0.8 and f1 == 1.0
+    assert coverage_accuracy([True, True, False, False], [True, False, True, True]) == (0.5, 0.5)

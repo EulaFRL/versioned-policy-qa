@@ -6,7 +6,7 @@ P = {"a": Passage("a", "doc", "dmv", "You can renew online."), "b": Passage("b",
 TURN = Turn("d", 1, "dmv", [], "how do I renew?")
 
 
-def run(replies, verdicts):
+def run(replies, verdicts, top_score=1.0, min_score=None):
     """Stub answer model returning `replies` in order; stub judge returning one verdict per call."""
     replies, verdicts, asked = list(replies), list(verdicts), []
 
@@ -18,8 +18,9 @@ def run(replies, verdicts):
         ok = verdicts.pop(0)
         return {"verdicts": [{"claim": 1, "supported": ok, "problem": "" if ok else "not stated"}]}
 
-    g = Generator(P, llm, judge)
-    state, trace = Graph(g.nodes(), given={"turn": Turn, "ranked": list[str]}).run(turn=TURN, ranked=["a", "b"])
+    g = Generator(P, llm, judge, min_score=min_score)
+    given = {"turn": Turn, "ranked": list[str], "top_score": float | None}
+    state, trace = Graph(g.nodes(), given=given).run(turn=TURN, ranked=["a", "b"], top_score=top_score)
     return state, {r["node"]: r["status"] for r in trace.records}, asked
 
 
@@ -48,3 +49,10 @@ def test_refusal_is_kept_and_format_problems_skip_the_judge():
     assert state["outcome"] == "refused"
     state, _, asked = run(["Renew online.", "Renew online [1]."], [True])  # first reply has no citation
     assert state["outcome"] == "answered" and "uncited: Renew online." in asked[1][2]["content"]
+
+
+def test_low_rerank_score_refuses_without_asking():
+    state, _, asked = run([], [], top_score=-3.0, min_score=-1.0)
+    assert state["outcome"] == "refused" and asked == []
+    state, _, asked = run(["Renew online [1]."], [True], top_score=0.5, min_score=-1.0)
+    assert state["outcome"] == "answered" and len(asked) == 1

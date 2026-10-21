@@ -28,6 +28,10 @@ class Reranker:
         return out
 
     def rerank(self, query: str, pids: list[str], top_n: int | None = None) -> list[str]:
-        scores = self.score_many([(query, p) for p in pids])
-        ranked = [p for _, p in sorted(zip(scores, pids), key=lambda x: -x[0])]
+        ranked, _ = self.rerank_scored(query, pids)
         return ranked[:top_n] if top_n else ranked
+
+    def rerank_scored(self, query: str, pids: list[str]) -> tuple[list[str], list[float]]:
+        """All pids best first, with their scores."""
+        pairs = sorted(zip(self.score_many([(query, p) for p in pids]), pids), key=lambda x: -x[0])
+        return [p for _, p in pairs], [s for s, _ in pairs]

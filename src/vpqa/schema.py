@@ -26,3 +26,4 @@ class Turn:
     answerable: bool = True
     as_of: date | None = None
     user_act: str | None = None
+    withheld: list[str] = field(default_factory=list)  # pids kept out of retrieval for this turn

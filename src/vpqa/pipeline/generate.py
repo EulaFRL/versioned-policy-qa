@@ -1,5 +1,8 @@
 """The generation half of the DAG: answer -> verify -> (revise -> verify) x2 -> finalize.
 
+The answer node refuses without an LLM call when nothing was retrieved or the best rerank score is below
+min_score (configs `answer.min_score`, picked on train by scripts/select_refusal_gate.py).
+
 The revision loop is unrolled into fixed nodes that are skipped once an answer passes. An answer that still
 fails after the last revision, or that could not be generated at all, is replaced by the passage text
 itself with a note that the documents did not support a checked answer; a refusal (NOT_FOUND) is kept.
@@ -22,13 +25,14 @@ DEGRADED = "I could not check an answer against the documents, so here is the mo
 class Generator:
     def __init__(self, passages: dict[str, Passage], llm: Callable[[list[dict]], str],
                  judge: Callable[[list[dict]], dict | None], top_n: int = 5, max_revisions: int = 2,
-                 history_turns: int = 4, passage_words: int = 400):
+                 history_turns: int = 4, passage_words: int = 400, min_score: float | None = None):
         self.by_pid, self.llm, self.judge = passages, llm, judge
         self.top_n, self.max_revisions = top_n, max_revisions
         self.history_turns, self.passage_words = history_turns, passage_words
+        self.min_score = min_score  # refuse without asking the LLM when the best rerank score is below this
 
     def nodes(self, limit: Callable[[str], float | None] = lambda name: None) -> list[Node]:
-        nodes = [Node("answer", self.respond, {"turn": Turn, "ranked": list[str]}, ANSWER_OUT,
+        nodes = [Node("answer", self.respond, {"turn": Turn, "ranked": list[str], "top_score": float | None}, ANSWER_OUT,
                       limit("answer"), fallback=self.no_answer),
                  Node("verify", self.verify, {"turn": Turn, "refused": bool, "claims": list[dict],
                                               "issues": list[str], "messages": list[dict]}, VERIFY_OUT,
@@ -53,14 +57,15 @@ class Generator:
                 "issues": parsed.issues, "claims": [{"text": t, "pids": ps} for t, ps in parsed.claims],
                 "messages": messages}
 
-    def respond(self, turn: Turn, ranked: list[str]) -> dict:
-        if not ranked:
-            return {**self.no_answer(turn, ranked), "answer": cited.NOT_FOUND, "refused": True}
+    def respond(self, turn: Turn, ranked: list[str], top_score: float | None) -> dict:
+        if not ranked or (self.min_score is not None and top_score is not None and top_score < self.min_score):
+            return {**self.no_answer(turn, ranked, top_score), "answer": cited.NOT_FOUND, "refused": True,
+                    "issues": []}
         passages = [self.by_pid[p] for p in self.shown(ranked)]
         return self.ask(cited.first_messages(turn, passages, history_turns=self.history_turns,
                                               passage_words=self.passage_words), ranked)
 
-    def no_answer(self, turn: Turn, ranked: list[str]) -> dict:
+    def no_answer(self, turn: Turn, ranked: list[str], top_score: float | None = None) -> dict:
         """Fallback: no answer to check or revise; finalize shows the passage text instead."""
         return {"answer": "", "cited_pids": [], "refused": False, "issues": ["no answer was generated"],
                 "claims": [], "messages": []}

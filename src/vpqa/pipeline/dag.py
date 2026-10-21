@@ -1,11 +1,11 @@
-"""Fixed pipeline: query -> route -> version filter -> retrieve -> rerank, then (vpqa.pipeline.generate)
+"""Fixed pipeline: query -> route -> corpus filter -> retrieve -> rerank, then (vpqa.pipeline.generate)
 answer -> verify -> at most two revisions -> finalize.
 
 Every stage is a node of vpqa.pipeline.engine.Graph with declared input and output types, so the order
 is fixed in code and each run leaves a per-node trace. Stages with a time budget (configs `harness`) degrade
 instead of failing: route -> search all domains, retrieve -> BM25 only, rerank -> keep the RRF order,
 answer or verify -> show the passage text instead of an unchecked answer. The
-version filter has no fallback: searching every version would silently return stale text.
+corpus filter has no fallback: searching every version would silently return stale text.
 
 Model calls hold one lock: a timed-out stage keeps running in its thread, and two threads using the GPU at
 once crash Metal (MPS). A stage that waits for the lock spends its own budget and falls back.
@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import pickle
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,7 +43,8 @@ class Result:
 
 class Pipeline:
     def __init__(self, passages: list[Passage], cfg: dict, dense_cache: Path | None = None,
-                 router: Path | None = None, rerank: bool = True, timeouts: bool = True, generate: bool = False):
+                 router: Path | None = None, rerank: bool = True, timeouts: bool = True, generate: bool = False,
+                 version_filter: bool = True):
         qcfg, self.rcfg = cfg["query"], cfg["retrieval"]
         self.qcfg = qcfg
         self.by_pid = {p.pid: p for p in passages}
@@ -58,24 +61,31 @@ class Pipeline:
         self.start = np.array([p.effective_from.toordinal() if p.effective_from else 0 for p in passages])
         self.end = np.array([p.effective_to.toordinal() if p.effective_to else np.iinfo(np.int64).max
                              for p in passages])
-        self.versioned = any(p.effective_from for p in passages)
+        self.versioned = version_filter and any(p.effective_from for p in passages)  # False: ablation, all versions
+        self.row = {p.pid: i for i, p in enumerate(passages)}
+        self.departments = sorted({p.domain for p in passages})
+        fan_out = cfg.get("route", {}).get("fan_out", {})
+        self.fan_out = fan_out if fan_out.get("enabled") else None  # per-department search when no route
+        self.pool = ThreadPoolExecutor(len(self.departments)) if self.fan_out else None
         ms = cfg.get("harness", {}).get("timeouts_ms", {}) if timeouts else {}
         limit = lambda name: ms[name] / 1000 if name in ms else None
         nodes = [
             Node("query", self.query, {"turn": Turn}, {"query": str}),
             Node("route", self.route, {"turn": Turn}, {"domain": str | None},
                  limit("route"), fallback=lambda turn: {"domain": None}),
-            Node("version_filter", self.version_filter, {"turn": Turn}, {"valid": np.ndarray | None}),
+            Node("corpus_filter", self.corpus_filter, {"turn": Turn}, {"valid": np.ndarray | None}),
             Node("retrieve", self.retrieve, {"query": str, "domain": str | None, "valid": np.ndarray | None},
-                 {"bm25": list[str], "dense": list[str], "candidates": list[str]},
+                 {"bm25": list[str], "dense": list[str], "candidates": list[str], "skipped": list[str]},
                  limit("retrieve"), fallback=self.retrieve_bm25),
-            Node("rerank", self.rerank, {"query": str, "candidates": list[str]}, {"ranked": list[str]},
-                 limit("rerank"), fallback=lambda query, candidates: {"ranked": candidates}),
+            Node("rerank", self.rerank, {"query": str, "candidates": list[str]},
+                 {"ranked": list[str], "top_score": float | None},
+                 limit("rerank"), fallback=lambda query, candidates: {"ranked": candidates, "top_score": None}),
         ]
         if generate:
             a = cfg.get("answer", {})
             self.generator = Generator(self.by_pid, llm.chat, llm.chat_json, self.rcfg["top_n"],
-                                       a.get("max_revisions", 2), a.get("history_turns", 4), a.get("passage_words", 400))
+                                       a.get("max_revisions", 2), a.get("history_turns", 4), a.get("passage_words", 400),
+                                       a.get("min_score"))
             nodes += self.generator.nodes(limit)
         self.graph = Graph(nodes, given={"turn": Turn})
         self.warm_up()
@@ -100,28 +110,65 @@ class Pipeline:
             emb = self.dense.encode([routing_text(turn, r["mode"])])
         return {"domain": r["router"].route(emb, threshold)[0]}
 
-    def version_filter(self, turn: Turn) -> dict:
-        """Passages in force on the turn's as-of date; None when the turn or corpus carries no dates."""
-        if turn.as_of is None or not self.versioned:
-            return {"valid": None}
-        day = turn.as_of.toordinal()
-        return {"valid": (self.start <= day) & (day < self.end)}
+    def corpus_filter(self, turn: Turn) -> dict:
+        """Passages that may be retrieved: in force on the turn's as-of date and not withheld; None for all.
+
+        Withheld passages are masked, not removed, so BM25 still uses the full corpus statistics.
+        """
+        valid = None
+        if turn.as_of is not None and self.versioned:
+            day = turn.as_of.toordinal()
+            valid = (self.start <= day) & (day < self.end)
+        if turn.withheld:
+            valid = np.ones(len(self.row), bool) if valid is None else valid
+            valid[[self.row[p] for p in turn.withheld]] = False
+        return {"valid": valid}
 
     def retrieve(self, query: str, domain: str | None, valid: np.ndarray | None) -> dict:
+        if domain is None and self.fan_out:
+            return self.retrieve_departments(query, valid)
         bm25 = self.bm25.search(query, self.rcfg["bm25_k"], domain, valid)
         with self.model_lock:
             dense = self.dense.search(query, self.rcfg["dense_k"], domain, valid)
-        return {"bm25": bm25, "dense": dense, "candidates": rrf([bm25, dense], k=self.rcfg["rrf_k"])}
+        return {"bm25": bm25, "dense": dense, "candidates": rrf([bm25, dense], k=self.rcfg["rrf_k"]), "skipped": []}
+
+    def retrieve_departments(self, query: str, valid: np.ndarray | None) -> dict:
+        """No confident route: search every department on its own, in parallel, each within its own budget.
+
+        A department that runs out of time is left out and listed in `skipped`. Each department's BM25 and
+        dense lists are fused, then the departments' lists are fused, so every department that answered
+        reaches the reranker even when one department dominates the global scores.
+        """
+        k, budget = self.fan_out["k"], self.fan_out["timeout_ms"] / 1000
+
+        def one(dept: str) -> tuple[list[str], list[str]]:
+            bm25 = self.bm25.search(query, k, dept, valid)
+            with self.model_lock:
+                return bm25, self.dense.search(query, k, dept, valid)
+
+        futures = {d: self.pool.submit(one, d) for d in self.departments}
+        deadline = time.perf_counter() + budget
+        lists, skipped = {}, []
+        for d, f in futures.items():
+            try:
+                lists[d] = f.result(timeout=max(deadline - time.perf_counter(), 0.0))
+            except TimeoutError:
+                skipped.append(d)
+        fused = [rrf([b, dn], k=self.rcfg["rrf_k"]) for b, dn in lists.values()]
+        return {"bm25": [p for b, _ in lists.values() for p in b], "dense": [p for _, dn in lists.values() for p in dn],
+                "candidates": rrf(fused, k=self.rcfg["rrf_k"]), "skipped": skipped}
 
     def retrieve_bm25(self, query: str, domain: str | None, valid: np.ndarray | None) -> dict:
         bm25 = self.bm25.search(query, self.rcfg["bm25_k"], domain, valid)
-        return {"bm25": bm25, "dense": [], "candidates": bm25}
+        return {"bm25": bm25, "dense": [], "candidates": bm25, "skipped": []}
 
     def rerank(self, query: str, candidates: list[str]) -> dict:
-        if self.reranker is None:
-            return {"ranked": candidates}
+        """Cross-encoder order; top_score (the best candidate's score) gates answering, None without a rerank."""
+        if self.reranker is None or not candidates:
+            return {"ranked": candidates, "top_score": None}
         with self.model_lock:
-            return {"ranked": self.reranker.rerank(query, candidates)}
+            ranked, scores = self.reranker.rerank_scored(query, candidates)
+        return {"ranked": ranked, "top_score": scores[0]}
 
     def run(self, turn: Turn) -> tuple[dict, Trace]:
         return self.graph.run(turn=turn)
