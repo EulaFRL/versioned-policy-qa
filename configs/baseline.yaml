@@ -23,3 +23,4 @@ harness:
 answer:
   history_turns: 4    # utterances shown to the answer model
   passage_words: 400  # each of the top_n passages is cut to this many words
+  max_revisions: 2    # verifier rejects -> rewrite with its problems, at most this often -> show passage text

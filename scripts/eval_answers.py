@@ -3,10 +3,11 @@
     python scripts/eval_answers.py --dataset md2d --n 20
     python scripts/eval_answers.py --dataset ecfr --n 20
 
-Needs VPQA_API_BASE / VPQA_API_KEY / VPQA_MODEL (vpqa.llm). Per item it records the answer, the cited pids
-and the parse issues; the summary reports how often the model refused, cited a gold passage (Cite-Hit),
-the share of cited passages that are gold (Cite-Prec), how often the reply had a parse issue, how often
-the verifier passed it, latency
+Needs VPQA_API_BASE / VPQA_API_KEY / VPQA_MODEL (vpqa.llm). Per item it records the first answer, its
+verdict, the number of revisions and the final outcome (answered, refused, or degraded to passage text).
+The summary reports, for the first answer: how often the model refused, cited a gold passage (Cite-Hit),
+the share of cited passages that are gold (Cite-Prec), how often the reply had a parse issue and how
+often the verifier passed it; for the final output: the outcome shares and Cite-Hit; latency
 and the API cost of the run (cached calls count at the cost of the call that filled the cache).
 """
 from __future__ import annotations
@@ -67,10 +68,15 @@ def main() -> None:
         run_id = f"{t.dialog_id}/{t.turn_id}"
         trace.write(trace_path, run_id)
         ms = {r["node"]: r["ms"] for r in trace.records}
-        status = {r["node"]: r["status"] for r in trace.records if r["status"] != "ok"}
+        status = {r["node"]: r["status"] for r in trace.records if r["status"] not in ("ok", "skipped")}
+        first = {r["node"]: r.get("outputs", {}) for r in trace.records}
         rows.append({"id": run_id, "query": t.query, "gold": t.gold_pids, "top5": state["ranked"][:5],
-                     **{k: state[k] for k in ("answer", "cited_pids", "refused", "issues", "verified", "problems")},
-                     "answer_ms": ms.get("answer"), "degraded": status})
+                     "answer": first["answer"]["answer"], "cited_pids": first["answer"]["cited_pids"],
+                     "refused": first["answer"]["refused"], "issues": first["answer"]["issues"],
+                     "verified": first["verify"]["verified"], "problems": first["verify"]["problems"],
+                     "revisions": sum(n.startswith("revise") and ms[n] > 0 for n in ms),
+                     **{k: state[k] for k in ("final", "final_pids", "outcome")},
+                     "answer_ms": ms.get("answer"), "total_ms": sum(ms.values()), "fallbacks": status})
     (args.out / f"{name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
 
     answered = [r for r in rows if not r["refused"]]
@@ -84,8 +90,13 @@ def main() -> None:
                                     for r in answered if r["cited_pids"]] or [0.0])),
         "with_issue": sum(bool(r["issues"]) for r in answered) / max(len(answered), 1),
         "verified": sum(r["verified"] for r in answered) / max(len(answered), 1),
-        "degraded": sum(bool(r["degraded"]) for r in rows) / len(rows),
+        "final": {o: sum(r["outcome"] == o for r in rows) / len(rows) for o in ("answered", "refused", "degraded")},
+        "revised": sum(r["revisions"] > 0 for r in rows) / len(rows),
+        "final_Cite-Hit": sum(bool(set(r["final_pids"]) & set(r["gold"])) for r in rows if r["outcome"] != "refused")
+                          / max(sum(r["outcome"] != "refused" for r in rows), 1),
+        "fallbacks": sum(bool(r["fallbacks"]) for r in rows) / len(rows),
         "answer_ms_p50": float(np.median([r["answer_ms"] for r in rows if r["answer_ms"] is not None])),
+        "total_ms_p50": float(np.median([r["total_ms"] for r in rows])),
         "llm": dict(llm.TOTALS),
         "cost_per_item": llm.TOTALS["cost"] / len(rows),
     }

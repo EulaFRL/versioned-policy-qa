@@ -33,6 +33,11 @@ Conversation so far:
 
 Latest user message: {query}"""
 
+FEEDBACK = """A check of your answer found these problems:
+{problems}
+
+Rewrite the answer under the same rules. Correct or drop every statement the cited passages do not support, and end every statement with its citations. If what remains does not answer the message, reply with exactly {not_found}."""
+
 _CLAIM = re.compile(r"(.*?)((?:\s*\[\d+\])+)[.!?]?", re.S)
 _CITE = re.compile(r"\[(\d+)\]")
 
@@ -82,6 +87,11 @@ def parse(reply: str, pids: list[str]) -> Parsed:
     return Parsed(text, cited, refused=False, issues=issues, claims=claims)
 
 
-def answer(turn: Turn, passages: list[Passage], llm: Callable[[list[dict]], str], **kw) -> Parsed:
-    reply = llm([{"role": "user", "content": build_prompt(turn, passages, **kw)}])
-    return parse(reply, [p.pid for p in passages])
+def first_messages(turn: Turn, passages: list[Passage], **kw) -> list[dict]:
+    return [{"role": "user", "content": build_prompt(turn, passages, **kw)}]
+
+
+def revision_messages(messages: list[dict], previous: str, problems: list[str]) -> list[dict]:
+    """The conversation so far plus the rejected answer and what the verifier found wrong with it."""
+    feedback = FEEDBACK.format(problems="\n".join(f"- {p}" for p in problems), not_found=NOT_FOUND)
+    return [*messages, {"role": "assistant", "content": previous}, {"role": "user", "content": feedback}]

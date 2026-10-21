@@ -1,9 +1,10 @@
-"""Fixed pipeline: query -> route -> version filter -> retrieve -> rerank -> answer -> verify.
+"""Fixed pipeline: query -> route -> version filter -> retrieve -> rerank, then (vpqa.pipeline.generate)
+answer -> verify -> at most two revisions -> finalize.
 
 Every stage is a node of vpqa.pipeline.engine.Graph with declared input and output types, so the order
 is fixed in code and each run leaves a per-node trace. Stages with a time budget (configs `harness`) degrade
 instead of failing: route -> search all domains, retrieve -> BM25 only, rerank -> keep the RRF order,
-answer -> quote the top passage, verify -> fail the answer. The
+answer or verify -> show the passage text instead of an unchecked answer. The
 version filter has no fallback: searching every version would silently return stale text.
 
 Model calls hold one lock: a timed-out stage keeps running in its thread, and two threads using the GPU at
@@ -19,7 +20,7 @@ from pathlib import Path
 import numpy as np
 
 from vpqa import llm
-from vpqa.pipeline import answer, verifier
+from vpqa.pipeline.generate import Generator
 from vpqa.pipeline.engine import Graph, Node, Trace
 from vpqa.retrieval.bm25 import BM25Index
 from vpqa.retrieval.dense import DenseIndex
@@ -41,7 +42,7 @@ class Result:
 class Pipeline:
     def __init__(self, passages: list[Passage], cfg: dict, dense_cache: Path | None = None,
                  router: Path | None = None, rerank: bool = True, timeouts: bool = True, generate: bool = False):
-        qcfg, self.rcfg, self.acfg = cfg["query"], cfg["retrieval"], cfg.get("answer", {})
+        qcfg, self.rcfg = cfg["query"], cfg["retrieval"]
         self.qcfg = qcfg
         self.by_pid = {p.pid: p for p in passages}
         self.bm25 = BM25Index(passages)
@@ -72,14 +73,10 @@ class Pipeline:
                  limit("rerank"), fallback=lambda query, candidates: {"ranked": candidates}),
         ]
         if generate:
-            nodes.append(Node("answer", self.respond, {"turn": Turn, "ranked": list[str]},
-                              {"answer": str, "cited_pids": list[str], "refused": bool, "issues": list[str],
-                               "claims": list[dict]},
-                              limit("answer"), fallback=self.quote))
-            nodes.append(Node("verify", self.verify, {"turn": Turn, "refused": bool, "claims": list[dict],
-                                                      "issues": list[str]},
-                              {"verified": bool, "problems": list[str]}, limit("verify"),
-                              fallback=lambda **_: {"verified": False, "problems": ["verifier did not finish"]}))
+            a = cfg.get("answer", {})
+            self.generator = Generator(self.by_pid, llm.chat, llm.chat_json, self.rcfg["top_n"],
+                                       a.get("max_revisions", 2), a.get("history_turns", 4), a.get("passage_words", 400))
+            nodes += self.generator.nodes(limit)
         self.graph = Graph(nodes, given={"turn": Turn})
         self.warm_up()
 
@@ -125,33 +122,6 @@ class Pipeline:
             return {"ranked": candidates}
         with self.model_lock:
             return {"ranked": self.reranker.rerank(query, candidates)}
-
-    def respond(self, turn: Turn, ranked: list[str]) -> dict:
-        if not ranked:
-            return {"answer": answer.NOT_FOUND, "cited_pids": [], "refused": True, "issues": ["no passages"],
-                    "claims": []}
-        shown = [self.by_pid[p] for p in ranked[:self.rcfg["top_n"]]]
-        parsed = answer.answer(turn, shown, llm.chat, **self.acfg)
-        return {"answer": parsed.answer, "cited_pids": parsed.cited_pids, "refused": parsed.refused,
-                "issues": parsed.issues, "claims": [{"text": t, "pids": ps} for t, ps in parsed.claims]}
-
-    def quote(self, turn: Turn, ranked: list[str]) -> dict:
-        """Fallback when no answer could be generated: show the top passage as is."""
-        if not ranked:
-            return {"answer": answer.NOT_FOUND, "cited_pids": [], "refused": True, "issues": ["no passages"],
-                    "claims": []}
-        top = self.by_pid[ranked[0]]
-        text = " ".join(top.text.split()[:80])
-        return {"answer": f"I could not compose a checked answer. The most relevant passage says: \"{text}\" [1]",
-                "cited_pids": [top.pid], "refused": False, "issues": ["fallback: quoted the top passage"],
-                "claims": []}
-
-    def verify(self, turn: Turn, refused: bool, claims: list[dict], issues: list[str]) -> dict:
-        if refused:
-            return {"verified": True, "problems": []}
-        v = verifier.verify([(c["text"], c["pids"]) for c in claims], issues, self.by_pid, turn.as_of,
-                            llm.chat_json, self.acfg.get("passage_words", 400))
-        return {"verified": v.passed, "problems": v.problems}
 
     def run(self, turn: Turn) -> tuple[dict, Trace]:
         return self.graph.run(turn=turn)

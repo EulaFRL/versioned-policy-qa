@@ -39,6 +39,7 @@ class Node:
     outputs: dict[str, Any]
     timeout_s: float | None = None  # budget for this stage
     fallback: Callable[..., dict[str, Any]] | None = None  # same inputs and outputs as fn
+    skip_if: str | None = None  # name of a bool in the state; all outputs must already exist upstream
 
 
 def call_with_timeout(fn: Callable[..., dict], args: dict, timeout_s: float | None) -> dict:
@@ -122,6 +123,12 @@ class Graph:
                     raise ContractError(f"{node.name}: input {key!r} is not produced by any earlier node")
                 if available[key] != tp and tp is not Any:
                     raise ContractError(f"{node.name}: input {key!r} is {tp}, upstream declares {available[key]}")
+            if node.skip_if is not None:
+                if available.get(node.skip_if) is not bool:
+                    raise ContractError(f"{node.name}: skip_if {node.skip_if!r} is not an upstream bool")
+                missing = [k for k, tp in node.outputs.items() if available.get(k) != tp]
+                if missing:
+                    raise ContractError(f"{node.name}: skippable, but {missing} not produced upstream")
             available.update(node.outputs)
 
     def run(self, budget_s: float | None = None, **values) -> tuple[dict[str, Any], Trace]:
@@ -133,6 +140,9 @@ class Graph:
         trace.add(node="<given>", status="ok", ms=0.0, outputs=summarize(values))
         deadline = None if budget_s is None else time.perf_counter() + budget_s
         for node in self.nodes:
+            if node.skip_if is not None and state[node.skip_if]:
+                trace.add(node=node.name, status="skipped", ms=0.0)
+                continue
             args = {k: state[k] for k in node.inputs}
             timeout = node.timeout_s
             if deadline is not None:

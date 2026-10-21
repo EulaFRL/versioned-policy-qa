@@ -90,3 +90,13 @@ def test_total_budget_sends_later_nodes_to_fallback():
     state, trace = g.run(budget_s=0.1, xs=[1])
     assert [r["status"] for r in trace.records] == ["ok", "timeout", "timeout"]
     assert state["total"] == -1 and "budget spent" in trace.records[-1]["error"]
+
+
+def test_skip_if_leaves_outputs_and_needs_them_upstream():
+    flag = Node("flag", lambda xs: {"done": True, "ys": xs}, {"xs": list[int]}, {"done": bool, "ys": list[int]})
+    again = Node("again", double, {"xs": list[int]}, {"ys": list[int]}, skip_if="done")
+    state, trace = Graph([flag, again], given={"xs": list[int]}).run(xs=[1])
+    assert state["ys"] == [1] and trace.records[-1]["status"] == "skipped"
+    with pytest.raises(ContractError, match="skippable"):
+        Graph([Node("flag", lambda xs: {"done": True}, {"xs": list[int]}, {"done": bool}), again],
+              given={"xs": list[int]})
