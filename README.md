@@ -33,7 +33,9 @@ run writes a JSONL trace: the full inputs, then per node its status, latency and
 
 Raw data is not committed; see `scripts/download_data.py` and `scripts/build_ecfr.py`. The eCFR
 version-conflict questions are committed in `data/benchmark/`: `ecfr_version_qa.jsonl` holds the items,
-`ecfr_version_qa.log.jsonl` the outcome of every candidate pair, including the rejected ones.
+`ecfr_version_qa.log.jsonl` the outcome of every candidate pair, including the rejected ones. So are the
+near-miss unanswerable turns built from MultiDoc2Dial (`md2d_near_miss_{train,validation}.jsonl`, see
+[Refusal](#refusal)), every rewrite with the checker's verdict, kept or not.
 
 ## Evaluation
 
@@ -43,8 +45,8 @@ version-conflict questions are committed in `data/benchmark/`: `ecfr_version_qa.
   that are gold
 - Version accuracy: on the eCFR version-conflict questions, R@k of the version in force on the question's
   date, plus how often a stale or not-yet-effective version is retrieved instead
-- Refusal: precision/recall of refusing, on the same turns made unanswerable by withholding their gold
-  documents
+- Refusal: precision/recall of refusing, on the same turns made unanswerable two ways: their gold
+  documents withheld, or the question rewritten to ask what the documents do not say (near-miss)
 
 ### Retrieval on MultiDoc2Dial
 
@@ -229,30 +231,37 @@ The answer model sees the top 5 reranked passages (each cut to 400 words) and th
 must end every sentence with the passages it relies on, or reply NOT_FOUND. The verifier checks the
 format, that every cited version is in force on the question's date, and, in one LLM call, that each
 claim is supported by the passages it cites. A rejected answer is rewritten with the verifier's problems,
-at most twice; if none passes, the top passages are shown instead. claude-sonnet-5.5 for answer and
-verifier, temperature 0.
+at most twice; if none passes, the top passages are shown instead. Temperature 0. Two answer models:
+claude-sonnet-5.5, and deepseek-v4-flash at 1/22 of its input and 1/55 of its output token price; the verifier is
+claude-sonnet-5.5 in both (`VPQA_MODEL` answers, `VPQA_JUDGE_MODEL` judges).
 
 300 validation turns (seed 0), all answerable:
 
-| | Value |
-|---|---|
-| Answered / refused / passages shown | 0.833 / 0.167 / 0 |
-| Cite-Hit (final answers) | 0.552 |
-| Cite-Hit when a gold passage is in the top 5 | 0.868 |
-| Gold passage in the top 5 | 0.540 |
-| Refused although a gold passage was in the top 5 | 0.019 |
-| Cite-Prec | 0.300 |
-| First answers rejected by the verifier / passed after one or two rewrites | 25 / 24 + 1 |
-| Stage fallbacks | 0 |
-| Latency p50 / p95 (end to end) | 6.4 s / 15.4 s |
-| API cost | 1.73 USD (0.006 per turn) |
+| | Sonnet 5.5 | DeepSeek V4 Flash |
+|---|---|---|
+| Answered / refused / passages shown | 0.833 / 0.167 / 0 | 0.683 / 0.293 / 0.023 |
+| Cite-Hit (final answers) | 0.552 | 0.547 |
+| Cite-Hit when a gold passage is in the top 5 | 0.868 | 0.823 |
+| Gold passage in the top 5 | 0.540 | 0.540 |
+| Refused although a gold passage was in the top 5 | 0.019 | 0.130 |
+| Cite-Prec | 0.300 | 0.320 |
+| First answers rejected by the verifier / passed after one or two rewrites | 25 / 24 + 1 | 34 / 18 + 0 |
+| Stage fallbacks | 0 | 0.03 (answer or revise over 60 s: 6; route: 3) |
+| Latency p50 / p95 (end to end) | 6.4 s / 15.4 s | see [eCFR](#stale-versions-at-answer-time-ecfr) |
+| API cost per turn (answer model / all) | – / 0.006 USD | 0.0001 / 0.0014 USD |
 
-Retrieval is the bottleneck: when a gold passage is shown, the answer cites it 87% of the time; 8 of
+Retrieval is the bottleneck: when a gold passage is shown, Sonnet cites it 87% of the time; 8 of
 the 21 misses cite another passage of the gold document. The verifier changes little here (first-answer
 Cite-Hit 0.556): of the 25 rejected answers, 16 had a claim the cited passage does not support (an
 overstatement, or a conclusion about the user's case), 8 an uncited sentence, usually a remark on what
 the passages leave out, and 1 a verifier reply that could not be parsed; rewriting fixes the wording
 but leaves the evidence as it was (10 of the 25 cited a gold passage before the rewrite, 9 after).
+
+DeepSeek cites as accurately when it answers, at a quarter of the cost per turn (the verifier is now most
+of it), but it refuses more: 13% of turns with a gold passage shown, against 2%. Its rejected answers are
+fixed less often (18 of 34 after one rewrite; 9 end refused, 7 as passage text). The DeepSeek run reused
+answer-model replies cached by an earlier run that a network outage cut short, so its latency is not
+reported here; the eCFR run below has fresh calls throughout.
 
 ### Refusal
 
@@ -265,15 +274,55 @@ without the gold document found 109 of 300 withheld turns still answerable (`scr
 
 191 pairs (answerable turn and its withheld twin):
 
-| Declined | P | R | F1 |
-|---|---|---|---|
-| First answer (no verifier) | 0.664 | 0.466 | 0.548 |
-| Final output (verifier, rewrites) | 0.667 | 0.471 | 0.552 |
+| Declined, P / R / F1 | Sonnet 5.5 | DeepSeek V4 Flash |
+|---|---|---|
+| First answer (no verifier) | 0.664 / 0.466 / 0.548 | 0.618 / 0.534 / 0.573 |
+| Final output (verifier, rewrites) | 0.667 / 0.471 / 0.552 | 0.605 / 0.602 / 0.604 |
 
-Of the 191 unanswerable turns, 102 get a first answer, the verifier passes 79 of them unchanged, and 101
-end answered. The verifier checks that
-each claim is supported by the passages cited, not that the passages answer the question, so an answer
-about a neighbouring topic passes.
+With Sonnet answering, 102 of the 191 unanswerable turns get a first answer, the verifier passes 79 of
+them unchanged, and 101 end answered. The verifier checks that each claim is supported by the passages
+cited, not that the passages answer the question, so an answer about a neighbouring topic passes.
+
+**Near-miss turns.** Withholding a document tests evidence that is missing altogether. The harder case
+is retrieval returning the right page when that page answers a neighbouring question. For each of the
+300 turns (and 200 train turns, seed 1, for development), `scripts/make_near_miss.py` has
+claude-sonnet-5.5 rewrite the latest user message, given the conversation and the gold passages, to
+ask about one condition, group, amount or detail the text does not state. A checker from another model
+family (gpt-5-mini) is shown the whole gold document and the top 5 passages retrieved for the rewrite
+and says whether they answer it; only the rewrites it calls unanswered are kept: 174 of 300 (117 of 200
+on train; 1.08 USD for validation). The set was fixed before any system was run on it.
+
+174 pairs (answerable turn and its near-miss rewrite):
+
+| Declined, P / R / F1 | Sonnet 5.5 | DeepSeek V4 Flash |
+|---|---|---|
+| First answer (no verifier) | 0.724 / 0.408 / 0.522 | 0.742 / 0.678 / 0.709 |
+| Final output (verifier, rewrites) | 0.724 / 0.408 / 0.522 | 0.737 / 0.787 / 0.761 |
+
+Near-miss rewrites are refused more often than withheld turns, although a passage of the gold page is in
+the top 5 for 57% of them (54% of the original turns): shown the page, the model can see what it leaves
+out. The models differ: Sonnet answers 103 of 174; the verifier rejects 46 of those, and every
+rewrite becomes an answer that passes. DeepSeek answers 56; the verifier rejects 30, and 19 of those are
+rewritten to NOT_FOUND. Many answers counted as not declined are not wrong: they give what the page does say and state that it does not cover the asked detail, or ask
+the user to clarify.
+
+**Checking that the answer replies to the question.** The verifier can also judge, in a second call
+made only when every claim is supported, whether the answer as a whole replies to the latest user
+message (`answer.check_question`, off by default); a failure goes back to the rewrite like any other
+problem, and the rewrite may reply NOT_FOUND. It was developed on the train turns (a first version that
+asked both questions in one call changed the support verdicts of 26 of 154 answers, so it became a
+separate call) and then run once on validation, DeepSeek answering:
+
+| Set | Turns | Measure | Without check | With check | Only without / only with | McNemar p |
+|---|---|---|---|---|---|---|
+| answerable | 300 | declined | 0.317 | 0.317 | 2 / 2 | 1 |
+| answerable | 300 | answered with a gold citation | 0.387 | 0.387 | 1 / 1 | 1 |
+| withheld | 191 | declined | 0.602 | 0.623 | 0 / 4 | 0.125 |
+| near-miss | 174 | declined | 0.787 | 0.793 | 1 / 2 | 1 |
+
+No difference on any set (train: near-miss declined 0.880 against 0.889, answerable 0.250 against
+0.275), at about twice the verifier cost on answered turns. Most answers it could catch are already
+refused by the answer model or rejected by the support check. It stays off (`scripts/ab_verifier.py`).
 
 A refusal gate on the best rerank score (refuse before the LLM call when it is below a threshold) does
 not help. On 1,000 train pairs and on validation the score separates answerable from withheld turns only
@@ -294,6 +343,7 @@ checks every cited version against it.
 | filter | 0 | – | 0 | 0.958 | 0.95 / 0.05 / 0 | 6.2 s / 12.4 s | 0.009 USD |
 | unaware | 0.897 | 1.00 | 0.022 | 0.888 | 0.81 / 0.11 / 0.08 | 13.0 s / 27.1 s | 0.018 USD |
 | inject | 0.909 | 1.00 | 0.011 | 0.947 | 0.90 / 0.05 / 0.05 | 15.3 s / 28.1 s | 0.019 USD |
+| filter, DeepSeek V4 Flash answering | 0 | – | 0 | 0.922 | 0.81 / 0.10 / 0.09 | 8.8 s / 60.6 s | 0.003 USD |
 
 Shown a stale version, the model cites it in about 90% of answers, usually next to the right one. The
 verifier's date check rejects every one of them, and the rewrite drops the stale citation in all but 1–2%
@@ -301,32 +351,67 @@ of items; the price is one or two extra LLM rounds (twice the latency and cost) 
 falling back to passage text. Filtering at retrieval avoids all of that, so the verifier's version check
 is a safety net, not the mechanism.
 
+With DeepSeek answering (verifier still Sonnet), the filtered pipeline costs a third as much per item but
+is slower in the tail: its answer call has a p50 of 5.2 s against 2.9 s, and 5 of 100 answer calls and 1
+rewrite ran past the 60 s budget and fell back to passage text; with 3 items rejected twice, that makes
+the 9% shown as passages.
+
 ### Fixed DAG vs a ReAct agent
 
 Control group (`src/vpqa/pipeline/react.py`): the same model and the same retrieval and rerank, exposed
 as a `search(query, department)` tool; the model decides whether, what and where to search, at most 4
 times, then answers under the same citation rules. No verifier inside the loop; afterwards each ReAct
 answer is checked once by the DAG's verifier, only to measure support. First 100 of the 300 turns, and
-the same 100 with gold documents withheld.
+the same 100 with gold documents withheld; both answer models, Claude Sonnet 5.5 as the verifier. Cite-Hit
+and Cite-Prec here are over answered turns only (passage text shown instead of an answer does not count).
 
 | 100 answerable turns | Answered | Cite-Hit | Cite-Prec | Verifier pass | Searches | Latency p50 / p95 | Cost per turn |
 |---|---|---|---|---|---|---|---|
-| DAG, final | 0.780 | 0.603 | 0.327 | 0.910 (first answer) | 1 | 6.1 s / 13.7 s | 0.006 USD (with verifier) |
-| ReAct | 0.960 | 0.417 | 0.237 | 0.802 | 1.59 | 7.2 s / 12.9 s | 0.009 USD (without) |
+| Sonnet, DAG final | 0.780 | 0.603 | 0.327 | 0.910 (first answer) | 1 | 6.1 s / 13.7 s | 0.006 USD (with verifier) |
+| Sonnet, ReAct | 0.960 | 0.417 | 0.237 | 0.802 | 1.59 | 7.2 s / 12.9 s | 0.009 USD (without) |
+| DeepSeek, DAG first answer | 0.700 | 0.500 | 0.312 | 0.886 | 1 | – | – |
+| DeepSeek, DAG final | 0.650 | 0.538 | 0.335 | – | 1 | – | 0.0014 USD (with verifier) |
+| DeepSeek, ReAct | 0.980 | 0.449 | 0.250 | 0.694 | 2.24 | 7.2 s / 19.5 s | 0.0003 USD (without) |
+
+DeepSeek DAG latency is not given for the reason above (cached replies); its cost is the 300-turn mean.
 
 | 68 truly unanswerable pairs | Refusal P | R | F1 |
 |---|---|---|---|
-| DAG, final | 0.642 | 0.500 | 0.562 |
-| ReAct | 0.800 | 0.235 | 0.364 |
+| Sonnet, DAG final | 0.642 | 0.500 | 0.562 |
+| Sonnet, ReAct | 0.800 | 0.235 | 0.364 |
+| DeepSeek, DAG final | 0.597 | 0.632 | 0.614 |
+| DeepSeek, ReAct | 0.933 | 0.206 | 0.337 |
 
-The agent always searches (never answers from memory), never repeats a query, and when it names a
-department (70% of searches) it is always the dialogue's own. Its searches are as good as the DAG's: a
-gold passage is among what it sees on 55 of 100 turns, against 52 in the DAG's top 5, although it
-rewrites every message into its own query and sees 7.4 passages per turn. The gap is in answering: given
-a gold passage it cites it less often (0.77 against 0.94 on answered turns), and it answers almost every
-turn, including those where nothing relevant was found, so it refuses half as many unanswerable ones and
-its answers pass the verifier less often. The fixed query, the fixed top 5 and the verifier keep the DAG
-answer close to its evidence; the agent's freedom to search more does not buy better evidence here.
+The agent always searches (never answers from memory) and when it names a department it is almost always
+the dialogue's own. With Sonnet its searches are as good as the DAG's: a gold passage is among what it
+sees on 55 of 100 turns, against 52 in the DAG's top 5, although it rewrites every message into its own
+query and sees 7.4 passages per turn. The gap is in answering: given a gold passage it cites it less
+often (0.77 against 0.94 on answered turns), and it answers almost every turn, including those where
+nothing relevant was found, so it refuses far fewer unanswerable ones and its answers pass the verifier
+less often. The fixed query, the fixed top 5 and the verifier keep the DAG answer close to its evidence;
+the agent's freedom to search more does not buy better evidence here.
+
+The cheaper model widens the gap. As an agent it searches more (2.24 searches per turn; 22% of turns
+use all 4, 43% with gold withheld) and still answers 98% of turns, 85% with gold withheld; its answers
+pass the verifier less often than Sonnet's (0.694 against 0.802). In the DAG the same model is held
+back by the verifier: it answers fewer turns than Sonnet, but refuses more of the unanswerable ones
+(F1 0.614, the best of the four).
+
+On eCFR (dev, 100 items, every item dated) the agent's search tool takes an `as_of` date and searches
+only the versions in force then; the DAG filters by the item's date itself.
+
+| eCFR dev, 100 items | Answered | Cite-Hit | Cite-Prec | Verifier pass | Searches | Date set / right | Cites stale | Latency p50 / p95 |
+|---|---|---|---|---|---|---|---|---|
+| Sonnet, DAG final | 0.950 | 0.958 | 0.645 | 0.905 (first answer) | 1 | (filter) | 0 | 6.2 s / 12.4 s |
+| Sonnet, ReAct | 0.990 | 0.889 | 0.642 | 0.838 | 1.22 | 1.000 / 0.992 | 0.010 | 6.0 s / 11.4 s |
+| DeepSeek, DAG final | 0.810 | 0.938 | 0.655 | 0.785 (first answer) | 1 | (filter) | 0 | 8.8 s / 60.6 s |
+| DeepSeek, ReAct | 0.990 | 0.808 | 0.613 | 0.717 | 2.18 | 1.000 / 0.991 | 0 | 13.6 s / 44.6 s |
+
+Both agents pass a date on every search and the right one on 99% of them: told the date in the prompt,
+they use the tool's filter. Sonnet's agent cites a stale version once in 100 answers, on the search
+whose date it got wrong. With the date handled, the result repeats MultiDoc2Dial: the agent answers
+more, cites gold less often, and passes the verifier less often. Cost per item: Sonnet ReAct 0.012 USD,
+DeepSeek ReAct 0.0006 USD (verifier 0.003 and 0.002 USD on top).
 
 ### Searching each department when the router is unsure
 
@@ -378,7 +463,8 @@ again without budgets (LLM replies come from the response cache, so it costs not
 changed), and compares every node's outputs with the recorded ones: a node marked DIFFERENT is where
 code, index or prompt changed since the run; a node that timed out shows what it would have returned.
 
-Reproduce (generation needs VPQA_API_BASE / VPQA_API_KEY / VPQA_MODEL; about 11 USD in all):
+Reproduce (generation needs VPQA_API_BASE / VPQA_API_KEY / VPQA_MODEL, and VPQA_JUDGE_MODEL for a
+separate judge; about 11 USD with Sonnet answering and judging):
 
 ```
 python scripts/eval_answers.py --dataset md2d --n 300
@@ -388,11 +474,20 @@ python scripts/refusal_report.py runs/answers/md2d_validation_n300_s0.jsonl \
     runs/answers/md2d_validation_n300_s0_withheld.jsonl \
     --covered runs/answers/md2d_validation_n300_s0_withheld.covered.json
 python scripts/select_refusal_gate.py --train-n 1000
+python scripts/make_near_miss.py --split validation --n 300 --seed 0   # the files in data/benchmark are these
+python scripts/eval_answers.py --dataset md2d --n 300 --withhold near-miss
 python scripts/eval_answers.py --dataset ecfr --split dev --n 100 --versions filter   # or unaware / inject
-python scripts/eval_react.py --n 100                        # and --withhold gold-doc
+python scripts/eval_react.py --n 100                        # and --withhold gold-doc, --dataset ecfr
 python scripts/eval_fanout.py --k 5 10
 python scripts/eval_budgets.py --n 300                      # and --device cpu --scale none 1 0.5
 ```
+
+The cheaper answer model: `VPQA_MODEL=deepseek/deepseek-v4-flash VPQA_JUDGE_MODEL=anthropic/claude-sonnet-5.5`,
+the same commands with `--out runs/answers_dsv4flash` (and `--answers runs/answers_dsv4flash --out
+runs/react_dsv4flash` for eval_react.py). The question check: the three MultiDoc2Dial runs again with
+`--check-question` (written next to them with a `_cq` suffix), then
+`python scripts/ab_verifier.py runs/answers_dsv4flash`. `--workers N` runs N turns at once, without stage
+budgets or latency.
 
 ## Layout
 
@@ -417,4 +512,5 @@ pytest
 ```
 
 Everything runs on a laptop: embeddings and reranker are local, generation goes through an
-OpenAI-compatible API set by `VPQA_API_BASE` / `VPQA_API_KEY` / `VPQA_MODEL`.
+OpenAI-compatible API set by `VPQA_API_BASE` / `VPQA_API_KEY` / `VPQA_MODEL` (the answer model) and
+`VPQA_JUDGE_MODEL` (verifier and eval judges; defaults to `VPQA_MODEL`).
