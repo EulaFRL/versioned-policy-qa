@@ -25,11 +25,13 @@ DEGRADED = "I could not check an answer against the documents, so here is the mo
 class Generator:
     def __init__(self, passages: dict[str, Passage], llm: Callable[[list[dict]], str],
                  judge: Callable[[list[dict]], dict | None], top_n: int = 5, max_revisions: int = 2,
-                 history_turns: int = 4, passage_words: int = 400, min_score: float | None = None):
+                 history_turns: int = 4, passage_words: int = 400, min_score: float | None = None,
+                 check_question: bool = False):
         self.by_pid, self.llm, self.judge = passages, llm, judge
         self.top_n, self.max_revisions = top_n, max_revisions
         self.history_turns, self.passage_words = history_turns, passage_words
         self.min_score = min_score  # refuse without asking the LLM when the best rerank score is below this
+        self.check_question = check_question  # verifier also judges whether the answer replies to the message
 
     def nodes(self, limit: Callable[[str], float | None] = lambda name: None) -> list[Node]:
         nodes = [Node("answer", self.respond, {"turn": Turn, "ranked": list[str], "top_score": float | None}, ANSWER_OUT,
@@ -75,8 +77,12 @@ class Generator:
             return {"verified": True, "problems": []}
         if not messages:  # nothing was generated, so nothing can be revised either
             return {"verified": False, "problems": issues}
+        question = None
+        if self.check_question:
+            history = "\n".join(turn.history[-self.history_turns:]) if turn.history and self.history_turns else "(none)"
+            question = f"Conversation so far:\n{history}\n\nLatest user message: {turn.query}"
         v = verifier.verify([(c["text"], c["pids"]) for c in claims], issues, self.by_pid, turn.as_of,
-                            self.judge, self.passage_words)
+                            self.judge, self.passage_words, question)
         return {"verified": v.passed, "problems": v.problems}
 
     def not_verified(self, **_) -> dict:

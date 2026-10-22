@@ -1,5 +1,8 @@
 """Chat completions through any OpenAI-compatible API, configured by VPQA_API_BASE / VPQA_API_KEY / VPQA_MODEL.
 
+VPQA_MODEL answers (the DAG's answer and revise nodes, the ReAct agent); VPQA_JUDGE_MODEL, when set, does
+the judging (the verifier and the evaluation judges), so a cheap answer model can be checked by another one.
+
 Responses are cached on disk by (model, messages, temperature), so reruns cost nothing and are reproducible.
 Each cached response keeps the token usage (and, on OpenRouter, the cost) of the call that produced it;
 TOTALS sums them over every call in this process, cached or not, so a rerun reports what the run cost.
@@ -10,28 +13,38 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
 import httpx
 
 CACHE = Path("data/cache/llm")
-TOTALS = {"calls": 0, "cached": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0}
+_LOCK = threading.Lock()
+TOTALS = {"calls": 0, "cached": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0, "cost_by_model": {}}
 
 
-def _count(usage: dict | None, cached: bool) -> None:
-    TOTALS["calls"] += 1
-    TOTALS["cached"] += cached
-    for k in ("prompt_tokens", "completion_tokens", "cost"):
-        TOTALS[k] += (usage or {}).get(k) or 0
+def _count(model_name: str, usage: dict | None, cached: bool) -> None:
+    with _LOCK:  # calls may come from several threads (scripts/eval_answers.py --workers)
+        TOTALS["calls"] += 1
+        TOTALS["cached"] += cached
+        for k in ("prompt_tokens", "completion_tokens", "cost"):
+            TOTALS[k] += (usage or {}).get(k) or 0
+        by = TOTALS["cost_by_model"]
+        by[model_name] = by.get(model_name, 0.0) + ((usage or {}).get("cost") or 0)
 
 
 def model() -> str:
     return os.environ["VPQA_MODEL"]
 
 
-def chat(messages: list[dict], temperature: float = 0.0, max_tokens: int = 800, cache: Path = CACHE) -> str:
-    body = {"model": model(), "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+def judge_model() -> str:
+    return os.environ.get("VPQA_JUDGE_MODEL") or model()
+
+
+def chat(messages: list[dict], temperature: float = 0.0, max_tokens: int = 800, cache: Path = CACHE,
+         model_name: str | None = None) -> str:
+    body = {"model": model_name or model(), "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
     return complete(body, cache).get("content") or ""
 
 
@@ -49,15 +62,15 @@ def complete(body: dict, cache: Path = CACHE) -> dict:
     path = cache / key[:2] / f"{key}.json"
     if path.exists():
         hit = json.loads(path.read_text())
-        _count(hit.get("usage"), cached=True)
+        _count(body["model"], hit.get("usage"), cached=True)
         return hit.get("message") or {"role": "assistant", "content": hit["content"]}
     base = os.environ["VPQA_API_BASE"].rstrip("/")
     headers = {"Authorization": f"Bearer {os.environ['VPQA_API_KEY']}"}
     message, usage = None, None
     payload = {**body, "usage": {"include": True}} if "openrouter" in base else body  # not part of the cache key
-    for attempt in range(6):
+    for attempt in range(20):  # about 15 minutes: rides out a dropped connection
         try:
-            r = httpx.post(f"{base}/chat/completions", json=payload, headers=headers, timeout=120)
+            r = httpx.post(f"{base}/chat/completions", json=payload, headers=headers, timeout=90)
             if r.status_code == 429 or r.status_code >= 500:
                 raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
             r.raise_for_status()
@@ -66,11 +79,11 @@ def complete(body: dict, cache: Path = CACHE) -> dict:
             if message.get("content") or message.get("tool_calls"):
                 break
         except (httpx.TransportError, httpx.HTTPStatusError) as e:
-            if attempt == 5 or (isinstance(e, httpx.HTTPStatusError) and e.response.status_code != 429
+            if attempt == 19 or (isinstance(e, httpx.HTTPStatusError) and e.response.status_code != 429
                                 and e.response.status_code < 500):
                 raise
-        time.sleep(2 ** attempt)
-    _count(usage, cached=False)
+        time.sleep(min(2 ** attempt, 60))
+    _count(body["model"], usage, cached=False)
     if not message or not (message.get("content") or message.get("tool_calls")):  # empty: not cached, retried next run
         return {"role": "assistant", "content": ""}
     message = {k: message[k] for k in ("role", "content", "tool_calls") if message.get(k) is not None}
@@ -78,7 +91,9 @@ def complete(body: dict, cache: Path = CACHE) -> dict:
     entry = {"request": body, "content": message.get("content"), "usage": usage}
     if "tool_calls" in message:
         entry["message"] = message
-    path.write_text(json.dumps(entry))
+    tmp = path.with_suffix(f".{threading.get_ident()}.tmp")  # another thread may read the same key
+    tmp.write_text(json.dumps(entry))
+    tmp.replace(path)
     return message
 
 
@@ -89,3 +104,8 @@ def chat_json(messages: list[dict], **kw) -> dict | None:
         return json.loads(m.group(0)) if m else None
     except json.JSONDecodeError:
         return None
+
+
+def judge_json(messages: list[dict], **kw) -> dict | None:
+    """chat_json on the judge model."""
+    return chat_json(messages, model_name=judge_model(), **kw)

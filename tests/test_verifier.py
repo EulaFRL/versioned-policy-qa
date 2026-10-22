@@ -38,3 +38,23 @@ def test_support_verdicts():
 
 def test_question_only_passes():
     assert verify([], [], P, None, never_called).passed
+
+
+def test_question_check_rejects_an_answer_to_another_question():
+    claims = [("Fee is $20", ["new"])]
+    seen = []
+
+    def judge(messages):
+        seen.append(messages[0]["content"])
+        if "addresses_question" in seen[-1]:
+            return {"addresses_question": False, "gap": "the fee for seniors"}
+        return {"verdicts": [{"claim": 1, "supported": True}]}
+
+    v = verify(claims, [], P, None, judge, question="Latest user message: What do seniors pay?")
+    assert not v.passed and "the fee for seniors" in v.problems[0]
+    assert len(seen) == 2 and "What do seniors pay?" in seen[1] and "seniors" not in seen[0]  # support prompt unchanged
+    seen.clear()
+    verify(claims, [], P, None, lambda m: seen.append(1) or {"verdicts": [{"claim": 1, "supported": False}]},
+           question="Latest user message: What do seniors pay?")
+    assert len(seen) == 1  # an unsupported answer is not checked against the question
+    assert verify(claims, [], P, None, judge_all([True])).passed  # without the question, support only

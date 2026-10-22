@@ -5,10 +5,17 @@
     python scripts/eval_answers.py --dataset md2d --n 300 --withhold gold-doc
     python scripts/eval_answers.py --dataset ecfr --split dev --n 100 --versions unaware
     python scripts/eval_answers.py --dataset ecfr --split dev --n 100 --versions inject
+    python scripts/eval_answers.py --dataset md2d --n 300 --withhold near-miss
+    python scripts/eval_answers.py --dataset md2d --n 300 --check-question
 
 --withhold gold-doc turns the same sample into unanswerable questions: every passage of the documents that
 hold a gold passage is masked out of retrieval for that turn, so the right reply is a refusal. The two runs
-pair 1:1 by id (scripts/refusal_report.py).
+pair 1:1 by id (scripts/refusal_report.py). --withhold near-miss keeps the gold documents but replaces the
+latest user message with its near-miss rewrite (scripts/make_near_miss.py), on the turns whose rewrite was
+kept, so retrieval finds the right page and the page does not answer.
+
+--check-question turns on the verifier's check that the answer replies to what was asked
+(configs `answer.check_question`); output names get `_cq`.
 
 --versions (eCFR) sets how stale versions can reach the answer: `filter`, retrieval keeps only versions in
 force on the as-of date (the pipeline as configured); `unaware`, retrieval searches every version; `inject`,
@@ -31,6 +38,8 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -53,20 +62,26 @@ def load(dataset: str, cfg: dict, args) -> tuple[Pipeline, list[Turn]]:
     if dataset == "md2d":
         doc = RAW / "multidoc2dial_doc.json"
         turns = [t for t in load_turns(RAW / f"multidoc2dial_dial_{args.split}.json", doc) if t.answerable]
-        pipe = Pipeline(load_passages(doc), cfg, Path("data/index/BAAI__bge-m3.npy"), args.router, generate=True)
+        pipe = Pipeline(load_passages(doc), cfg, Path("data/index/BAAI__bge-m3.npy"), args.router, generate=True,
+                        timeouts=args.workers == 1)
     else:
         items = [json.loads(l) for l in args.qa.read_text().splitlines()]
         split = "dev" if args.split == "validation" else args.split
         turns = [Turn(it["qid"], 0, "", [], it["question"], [it["gold_pid"]], as_of=date.fromisoformat(it["as_of"]))
                  for it in items if it["split"] == split]
         pipe = Pipeline(load_versions(), cfg, Path("data/index/BAAI__bge-m3__ecfr.npy"), generate=True,
-                        version_filter=args.versions != "unaware")
+                        version_filter=args.versions != "unaware", timeouts=args.workers == 1)
         if args.versions == "inject":
             stale = {it["qid"]: it["other_versions"] for it in items}
             inject_stale(pipe, stale)
     turns = random.Random(args.seed).sample(turns, min(args.n, len(turns)))
     if args.withhold == "gold-doc":
         turns = withhold_gold_docs(turns, pipe.by_pid)
+    elif args.withhold == "near-miss":
+        rewrites = {r["id"]: r for r in map(json.loads, (args.near_miss / f"md2d_near_miss_{args.split}.jsonl")
+                                            .read_text().splitlines()) if r["kept"]}
+        turns = [replace(t, query=rewrites[f"{t.dialog_id}/{t.turn_id}"]["question"], answerable=False)
+                 for t in turns if f"{t.dialog_id}/{t.turn_id}" in rewrites]
     return pipe, turns
 
 
@@ -91,23 +106,31 @@ def main() -> None:
     ap.add_argument("--config", default="configs/baseline.yaml")
     ap.add_argument("--router", type=Path, default=Path("runs/router/router.pkl"))
     ap.add_argument("--qa", type=Path, default=Path("data/benchmark/ecfr_version_qa.jsonl"))
-    ap.add_argument("--withhold", choices=["none", "gold-doc"], default="none")
+    ap.add_argument("--withhold", choices=["none", "gold-doc", "near-miss"], default="none")
+    ap.add_argument("--near-miss", type=Path, default=Path("data/benchmark"))
+    ap.add_argument("--check-question", action="store_true")
     ap.add_argument("--versions", choices=["filter", "unaware", "inject"], default="filter")
     ap.add_argument("--out", type=Path, default=Path("runs/answers"))
+    ap.add_argument("--workers", type=int, default=1,
+                    help="turns run at once; above 1, no stage budgets and no latency (threads wait on each other)")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config))
+    if args.check_question:
+        cfg.setdefault("answer", {})["check_question"] = True
     pipe, turns = load(args.dataset, cfg, args)
     span_pids = ({f"{d}::{sp}": pids for (d, sp), pids in span_index(RAW / "multidoc2dial_doc.json").items()}
                  if args.dataset == "md2d" else {})
 
     args.out.mkdir(parents=True, exist_ok=True)
-    name = (f"{args.dataset}_{args.split}_n{args.n}_s{args.seed}" + ("_withheld" if args.withhold != "none" else "")
-            + (f"_{args.versions}" if args.versions != "filter" else ""))
+    name = (f"{args.dataset}_{args.split}_n{args.n}_s{args.seed}"
+            + {"none": "", "gold-doc": "_withheld", "near-miss": "_nearmiss"}[args.withhold]
+            + (f"_{args.versions}" if args.versions != "filter" else "") + ("_cq" if args.check_question else ""))
     trace_path = args.out / f"{name}.trace.jsonl"
     trace_path.unlink(missing_ok=True)
     rows = []
-    for t in turns:
-        state, trace = pipe.run(t)
+    with ThreadPoolExecutor(args.workers) as pool:
+        results = list(pool.map(pipe.run, turns))
+    for t, (state, trace) in zip(turns, results):
         run_id = f"{t.dialog_id}/{t.turn_id}"
         trace.write(trace_path, run_id)
         ms = {r["node"]: r["ms"] for r in trace.records}
@@ -146,10 +169,14 @@ def main() -> None:
                                         / max(sum(r["outcome"] != "refused" for r in gold_in_top), 1),
         "gold_in_top5": len(gold_in_top) / len(rows),
         "fallbacks": sum(bool(r["fallbacks"]) for r in rows) / len(rows),
-        "answer_ms_p50": float(np.median([r["answer_ms"] for r in rows if r["answer_ms"] is not None])),
-        "total_ms_p50": float(np.median([r["total_ms"] for r in rows])),
+        "workers": args.workers,
+        "answer_ms_p50": float(np.median([r["answer_ms"] for r in rows if r["answer_ms"] is not None]))
+                         if args.workers == 1 else None,
+        "total_ms_p50": float(np.median([r["total_ms"] for r in rows])) if args.workers == 1 else None,
         "llm": dict(llm.TOTALS),
         "cost_per_item": llm.TOTALS["cost"] / len(rows),
+        "answer_model": llm.model(), "judge_model": llm.judge_model(),
+        "answer_model_cost_per_item": llm.TOTALS["cost_by_model"].get(llm.model(), 0.0) / len(rows),
     }
     if args.dataset == "ecfr":
         stale_first = [r for r in answered if r["first_stale"]]

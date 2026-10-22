@@ -33,6 +33,10 @@ USER = """Conversation so far:
 
 Latest user message: {query}"""
 
+AS_OF = """
+
+The user asks about the rules in force on {as_of}."""
+
 
 @dataclass
 class ReactResult:
@@ -84,7 +88,8 @@ class ReactAgent:
         history = "\n".join(turn.history[-self.history_turns:]) if turn.history and self.history_turns else "(none)"
         messages = [{"role": "system", "content": SYSTEM.format(max_searches=self.max_searches,
                                                                 not_found=cited.NOT_FOUND)},
-                    {"role": "user", "content": USER.format(history=history, query=turn.query)}]
+                    {"role": "user", "content": USER.format(history=history, query=turn.query)
+                     + (AS_OF.format(as_of=turn.as_of) if turn.as_of else "")}]
         numbered: list[str] = []  # pid of passage [i + 1]
         searches, calls, forced = [], 0, False
         while True:

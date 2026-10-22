@@ -49,7 +49,7 @@ def main() -> None:
         t = turns[r["id"]]
         gold = " ".join(spans[s] for s in r["gold_spans"])
         passages = "\n\n".join(f"[{i + 1}] {' '.join(by_pid[p].text.split()[:400])}" for i, p in enumerate(r["top5"]))
-        out = llm.chat_json([{"role": "user", "content": PROMPT.format(
+        out = llm.judge_json([{"role": "user", "content": PROMPT.format(
             history="\n".join(t.history[-4:]) or "(none)", query=t.query, gold=gold, passages=passages)}])
         covered[r["id"]] = bool(out and out.get("covered"))
         reasons[r["id"]] = (out or {}).get("reason")
