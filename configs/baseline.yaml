@@ -2,6 +2,7 @@ query:
   history_turns: 4    # utterances, i.e. two user/agent rounds
   short_words: 7      # gated: add history only to utterances this short (picked on train, scripts/select_gate.py)
   max_words: 96       # ~p85 of 4-utterance queries; keeps dense query encoding under ~128 tokens
+  rewrite: "off"      # LLM rewrite of follow-ups (short | all): +1 point R@5 on train for 4 s p50 (scripts/eval_memory.py)
 retrieval:
   bm25_k: 20
   dense_model: BAAI/bge-m3
@@ -24,3 +25,8 @@ answer:
   history_turns: 4    # utterances shown to the answer model
   passage_words: 400  # each of the top_n passages is cut to this many words
   max_revisions: 2    # verifier rejects -> rewrite with its problems, at most this often -> show passage text
+memory:
+  # session focus: the best k passages of the documents the last `replies` replies cited join the rerank
+  # candidates, and every passage of those documents gets `bonus` on its rerank score (scripts/eval_memory.py).
+  # Off: it raises retrieval recall but not end-to-end success (scripts/loop.py, configs/skills.yaml).
+  focus: {enabled: false, replies: 2, k: 10, bonus: 0.1}

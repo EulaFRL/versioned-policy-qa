@@ -74,9 +74,11 @@ def complete(body: dict, cache: Path = CACHE) -> dict:
             if r.status_code == 429 or r.status_code >= 500:
                 raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
             r.raise_for_status()
-            message = r.json()["choices"][0]["message"]
-            usage = r.json().get("usage")
+            choice = r.json()["choices"][0]
+            message, usage = choice["message"], r.json().get("usage")
             if message.get("content") or message.get("tool_calls"):
+                break
+            if choice.get("finish_reason") == "length" or attempt >= 2:  # reasoning used up max_tokens: same again
                 break
         except (httpx.TransportError, httpx.HTTPStatusError) as e:
             if attempt == 19 or (isinstance(e, httpx.HTTPStatusError) and e.response.status_code != 429

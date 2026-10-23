@@ -27,3 +27,4 @@ class Turn:
     as_of: date | None = None
     user_act: str | None = None
     withheld: list[str] = field(default_factory=list)  # pids kept out of retrieval for this turn
+    focus_docs: list[str] = field(default_factory=list)  # session memory: documents the recent replies cited (vpqa.memory)

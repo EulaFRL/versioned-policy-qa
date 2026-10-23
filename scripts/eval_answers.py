@@ -14,6 +14,9 @@ pair 1:1 by id (scripts/refusal_report.py). --withhold near-miss keeps the gold 
 latest user message with its near-miss rewrite (scripts/make_near_miss.py), on the turns whose rewrite was
 kept, so retrieval finds the right page and the page does not answer.
 
+With session focus on (configs `memory.focus`), each sampled MultiDoc2Dial turn gets the focus its
+dialogue's earlier turns would leave behind, from replaying them through retrieval (with_session).
+
 --check-question turns on the verifier's check that the answer replies to what was asked
 (configs `answer.check_question`); output names get `_cq`.
 
@@ -38,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date
@@ -50,6 +54,7 @@ from vpqa import llm
 from vpqa.data.ecfr import load_versions
 from vpqa.data.multidoc2dial import load_passages, load_turns, span_index
 from vpqa.eval.refusal import withhold_gold_docs
+from vpqa.memory import Session
 from vpqa.pipeline import verifier
 from vpqa.pipeline.dag import Pipeline
 from vpqa.pipeline.engine import Graph, Node
@@ -61,7 +66,8 @@ RAW = Path("data/raw/multidoc2dial")
 def load(dataset: str, cfg: dict, args) -> tuple[Pipeline, list[Turn]]:
     if dataset == "md2d":
         doc = RAW / "multidoc2dial_doc.json"
-        turns = [t for t in load_turns(RAW / f"multidoc2dial_dial_{args.split}.json", doc) if t.answerable]
+        dialogue = load_turns(RAW / f"multidoc2dial_dial_{args.split}.json", doc)
+        turns = [t for t in dialogue if t.answerable]
         pipe = Pipeline(load_passages(doc), cfg, Path("data/index/BAAI__bge-m3.npy"), args.router, generate=True,
                         timeouts=args.workers == 1)
     else:
@@ -75,6 +81,8 @@ def load(dataset: str, cfg: dict, args) -> tuple[Pipeline, list[Turn]]:
             stale = {it["qid"]: it["other_versions"] for it in items}
             inject_stale(pipe, stale)
     turns = random.Random(args.seed).sample(turns, min(args.n, len(turns)))
+    if dataset == "md2d" and pipe.focus_cfg:
+        turns = with_session(pipe, dialogue, turns)
     if args.withhold == "gold-doc":
         turns = withhold_gold_docs(turns, pipe.by_pid)
     elif args.withhold == "near-miss":
@@ -83,6 +91,29 @@ def load(dataset: str, cfg: dict, args) -> tuple[Pipeline, list[Turn]]:
         turns = [replace(t, query=rewrites[f"{t.dialog_id}/{t.turn_id}"]["question"], answerable=False)
                  for t in turns if f"{t.dialog_id}/{t.turn_id}" in rewrites]
     return pipe, turns
+
+
+def with_session(pipe: Pipeline, dialogue: list[Turn], turns: list[Turn]) -> list[Turn]:
+    """`turns` with the session focus they would have (configs `memory.focus`): the earlier turns of each
+    dialogue run through retrieval, and the document of each one's top-ranked passage stands in for what
+    its reply cited, as in scripts/eval_memory.py."""
+    earlier = defaultdict(list)
+    for t in dialogue:
+        earlier[t.dialog_id].append(t)
+    out = []
+    for turn in turns:
+        session = Session()
+        for t in earlier[turn.dialog_id]:
+            if t.turn_id >= turn.turn_id:
+                break
+            t = replace(t, focus_docs=session.focus(pipe.focus_cfg.get("replies", 1)))
+            q, valid = pipe.query(t)["query"], pipe.corpus_filter(t)["valid"]
+            candidates = pipe.retrieve(q, pipe.route(t)["domain"], valid)["candidates"]
+            ranked = pipe.rerank(q, candidates, **pipe.focus(q, t, valid))["ranked"]
+            if ranked:
+                session.record([pipe.by_pid[ranked[0]].doc_id])
+        out.append(replace(turn, focus_docs=session.focus(pipe.focus_cfg.get("replies", 1))))
+    return out
 
 
 def inject_stale(pipe: Pipeline, stale: dict[str, list[str]]) -> None:

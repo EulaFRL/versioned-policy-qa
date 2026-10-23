@@ -57,7 +57,7 @@ def main() -> None:
             pipe.fan_out = {"k": setting, "timeout_ms": args.timeout_ms}
             out = pipe.retrieve_departments(q, None)
         mid = time.perf_counter()
-        ranked = pipe.rerank(q, out["candidates"])["ranked"]
+        ranked = pipe.rerank(q, out["candidates"], [], [])["ranked"]
         return ranked, out, (mid - start) * 1000, (time.perf_counter() - mid) * 1000
 
     settings = ["global", *args.k, "gold domain"]

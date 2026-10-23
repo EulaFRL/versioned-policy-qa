@@ -23,7 +23,7 @@ Rules:
 - Use only what the passages say. Do not add facts from your own knowledge.
 - If the passages do not answer the message, reply with exactly {not_found} and nothing else.
 - If the answer depends on the user's situation and the passages cover several cases, you may instead ask one short clarifying question; a question needs no citation.
-- At most three sentences.
+- At most three sentences.{rules}
 
 Passages:
 {passages}
@@ -58,11 +58,14 @@ def passage_label(p: Passage) -> str:
     return f"({p.doc_id}, in force from {p.effective_from}{until}) "
 
 
-def build_prompt(turn: Turn, passages: list[Passage], history_turns: int = 4, passage_words: int = 400) -> str:
+def build_prompt(turn: Turn, passages: list[Passage], history_turns: int = 4, passage_words: int = 400,
+                 rules: list[str] | None = None) -> str:
+    """The answer prompt; `rules` are extra lines appended to the rule list (configs `answer.rules`)."""
     shown = "\n\n".join(f"[{i}] {passage_label(p)}{' '.join(p.text.split()[:passage_words])}"
                         for i, p in enumerate(passages, 1))
     history = "\n".join(turn.history[-history_turns:]) if turn.history and history_turns else "(none)"
-    return PROMPT.format(not_found=NOT_FOUND, passages=shown, history=history, query=turn.query)
+    extra = "".join(f"\n- {r}" for r in rules or [])
+    return PROMPT.format(not_found=NOT_FOUND, passages=shown, history=history, query=turn.query, rules=extra)
 
 
 def parse(reply: str, pids: list[str]) -> Parsed:

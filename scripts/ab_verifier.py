@@ -15,27 +15,16 @@ from __future__ import annotations
 
 import argparse
 import json
-from math import comb
 from pathlib import Path
 
 from vpqa.eval.metrics import refusal_prf
+from vpqa.loop import mcnemar
 
 NAME = "md2d_validation_n300_s0"
 
 
 def load(path: Path) -> dict[str, dict]:
     return {r["id"]: r for r in map(json.loads, path.read_text().splitlines())}
-
-
-def mcnemar(a: list[bool], b: list[bool]) -> tuple[int, int, float]:
-    """Turns where only A holds, only B holds, and the exact two-sided p-value."""
-    only_a = sum(x and not y for x, y in zip(a, b))
-    only_b = sum(y and not x for x, y in zip(a, b))
-    n = only_a + only_b
-    if n == 0:
-        return 0, 0, 1.0
-    tail = sum(comb(n, k) for k in range(min(only_a, only_b) + 1)) / 2 ** n
-    return only_a, only_b, min(1.0, 2 * tail)
 
 
 def main() -> None:

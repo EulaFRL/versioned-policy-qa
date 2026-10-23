@@ -26,12 +26,13 @@ class Generator:
     def __init__(self, passages: dict[str, Passage], llm: Callable[[list[dict]], str],
                  judge: Callable[[list[dict]], dict | None], top_n: int = 5, max_revisions: int = 2,
                  history_turns: int = 4, passage_words: int = 400, min_score: float | None = None,
-                 check_question: bool = False):
+                 check_question: bool = False, rules: list[str] | None = None):
         self.by_pid, self.llm, self.judge = passages, llm, judge
         self.top_n, self.max_revisions = top_n, max_revisions
         self.history_turns, self.passage_words = history_turns, passage_words
         self.min_score = min_score  # refuse without asking the LLM when the best rerank score is below this
         self.check_question = check_question  # verifier also judges whether the answer replies to the message
+        self.rules = rules or []  # extra lines for the answer prompt's rule list
 
     def nodes(self, limit: Callable[[str], float | None] = lambda name: None) -> list[Node]:
         nodes = [Node("answer", self.respond, {"turn": Turn, "ranked": list[str], "top_score": float | None}, ANSWER_OUT,
@@ -65,7 +66,7 @@ class Generator:
                     "issues": []}
         passages = [self.by_pid[p] for p in self.shown(ranked)]
         return self.ask(cited.first_messages(turn, passages, history_turns=self.history_turns,
-                                              passage_words=self.passage_words), ranked)
+                                              passage_words=self.passage_words, rules=self.rules), ranked)
 
     def no_answer(self, turn: Turn, ranked: list[str], top_score: float | None = None) -> dict:
         """Fallback: no answer to check or revise; finalize shows the passage text instead."""

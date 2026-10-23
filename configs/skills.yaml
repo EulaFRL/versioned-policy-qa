@@ -1,0 +1,29 @@
+# Patches the offline loop (scripts/loop.py) may try, each aimed at one failure category (vpqa.loop).
+# A patch is merged into the current configuration: nested keys merge, lists are extended.
+- name: route-less-often
+  category: intent
+  patch: {route: {threshold: {first_turn: 0.97, follow_up: 0.9}}}
+- name: route-off
+  category: intent
+  patch: {route: {enabled: false}}
+- name: show-8-passages
+  category: retrieval
+  patch: {retrieval: {top_n: 8}}
+- name: session-focus
+  category: retrieval
+  patch: {memory: {focus: {enabled: true, replies: 2, k: 10, bonus: 0.1}}}  # picked on train by scripts/eval_memory.py
+- name: longer-passages
+  category: generation
+  patch: {answer: {passage_words: 800}}
+- name: more-revisions
+  category: generation
+  patch: {answer: {max_revisions: 3}}
+- name: rule-cite-direct-passage
+  category: generation
+  patch: {answer: {rules: ["Prefer the passage that states the answer directly over passages that only mention the topic, and cite it."]}}
+- name: rule-neighbouring-case
+  category: knowledge gap
+  patch: {answer: {rules: ["If the passages cover only a neighbouring case (another condition, group of people, amount, date or detail) and not the exact one the user asks about, reply with exactly NOT_FOUND."]}}
+- name: question-check
+  category: knowledge gap
+  patch: {answer: {check_question: true}}

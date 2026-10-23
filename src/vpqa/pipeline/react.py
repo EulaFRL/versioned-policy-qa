@@ -81,7 +81,7 @@ class ReactAgent:
         query = str(args.get("query") or turn.query)
         valid = self.pipe.corpus_filter(replace(turn, as_of=as_of))["valid"]
         candidates = self.pipe.retrieve(query, dept, valid)["candidates"]
-        ranked = self.pipe.rerank(query, candidates)["ranked"]
+        ranked = self.pipe.rerank(query, candidates, [], [])["ranked"]
         return ranked[:self.top_n], {"query": query, "department": dept, "as_of": args.get("as_of")}
 
     def run(self, turn: Turn) -> ReactResult:

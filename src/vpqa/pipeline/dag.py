@@ -1,11 +1,14 @@
-"""Fixed pipeline: query -> route -> corpus filter -> retrieve -> rerank, then (vpqa.pipeline.generate)
+"""Fixed pipeline: query -> route -> corpus filter -> retrieve -> focus -> rerank, then (vpqa.pipeline.generate)
 answer -> verify -> at most two revisions -> finalize.
 
 Every stage is a node of vpqa.pipeline.engine.Graph with declared input and output types, so the order
 is fixed in code and each run leaves a per-node trace. Stages with a time budget (configs `harness`) degrade
-instead of failing: route -> search all domains, retrieve -> BM25 only, rerank -> keep the RRF order,
+instead of failing: query rewrite -> the length-gated query, route -> search all domains, retrieve -> BM25 only, rerank -> keep the RRF order,
 answer or verify -> show the passage text instead of an unchecked answer. The
 corpus filter has no fallback: searching every version would silently return stale text.
+
+Session memory (configs `memory.focus`, vpqa.memory.Session) adds the best passages of the documents the
+previous reply cited to the rerank candidates and gives that document a fixed bonus on the rerank score.
 
 Model calls hold one lock: a timed-out stage keeps running in its thread, and two threads using the GPU at
 once crash Metal (MPS). A stage that waits for the lock spends its own budget and falls back.
@@ -27,7 +30,7 @@ from vpqa.pipeline.engine import Graph, Node, Trace
 from vpqa.retrieval.bm25 import BM25Index
 from vpqa.retrieval.dense import DenseIndex
 from vpqa.retrieval.fusion import rrf
-from vpqa.retrieval.query import build_query
+from vpqa.retrieval.query import build_query, needs_context, rewrite_query
 from vpqa.retrieval.rerank import Reranker
 from vpqa.retrieval.route import routing_text
 from vpqa.schema import Passage, Turn
@@ -54,9 +57,11 @@ class Pipeline:
         self.reranker_pid = passages[0].pid
         self.model_lock = threading.Lock()
         self.router = None
-        if router is not None:
+        route_cfg = cfg.get("route", {})
+        if router is not None and route_cfg.get("enabled", True):
             with open(router, "rb") as f:
                 self.router = pickle.load(f)
+            self.router["threshold"] = route_cfg.get("threshold", self.router["threshold"])
         # validity windows as day ordinals; no end date means still in force
         self.start = np.array([p.effective_from.toordinal() if p.effective_from else 0 for p in passages])
         self.end = np.array([p.effective_to.toordinal() if p.effective_to else np.iinfo(np.int64).max
@@ -64,28 +69,34 @@ class Pipeline:
         self.versioned = version_filter and any(p.effective_from for p in passages)  # False: ablation, all versions
         self.row = {p.pid: i for i, p in enumerate(passages)}
         self.departments = sorted({p.domain for p in passages})
+        self.doc_of = np.array([p.doc_id for p in passages])
+        focus = cfg.get("memory", {}).get("focus", {})
+        self.focus_cfg = focus if focus.get("enabled") else None
         fan_out = cfg.get("route", {}).get("fan_out", {})
         self.fan_out = fan_out if fan_out.get("enabled") else None  # per-department search when no route
         self.pool = ThreadPoolExecutor(len(self.departments)) if self.fan_out else None
         ms = cfg.get("harness", {}).get("timeouts_ms", {}) if timeouts else {}
         limit = lambda name: ms[name] / 1000 if name in ms else None
         nodes = [
-            Node("query", self.query, {"turn": Turn}, {"query": str}),
+            Node("query", self.query, {"turn": Turn}, {"query": str}, limit("rewrite"), fallback=self.gated_query),
             Node("route", self.route, {"turn": Turn}, {"domain": str | None},
                  limit("route"), fallback=lambda turn: {"domain": None}),
             Node("corpus_filter", self.corpus_filter, {"turn": Turn}, {"valid": np.ndarray | None}),
             Node("retrieve", self.retrieve, {"query": str, "domain": str | None, "valid": np.ndarray | None},
                  {"bm25": list[str], "dense": list[str], "candidates": list[str], "skipped": list[str]},
                  limit("retrieve"), fallback=self.retrieve_bm25),
-            Node("rerank", self.rerank, {"query": str, "candidates": list[str]},
+            Node("focus", self.focus, {"query": str, "turn": Turn, "valid": np.ndarray | None},
+                 {"focus_docs": list[str], "focus_pids": list[str]}),
+            Node("rerank", self.rerank, {"query": str, "candidates": list[str], "focus_docs": list[str],
+                                         "focus_pids": list[str]},
                  {"ranked": list[str], "top_score": float | None},
-                 limit("rerank"), fallback=lambda query, candidates: {"ranked": candidates, "top_score": None}),
+                 limit("rerank"), fallback=lambda query, candidates, **_: {"ranked": candidates, "top_score": None}),
         ]
         if generate:
             a = cfg.get("answer", {})
             self.generator = Generator(self.by_pid, llm.chat, llm.judge_json, self.rcfg["top_n"],
                                        a.get("max_revisions", 2), a.get("history_turns", 4), a.get("passage_words", 400),
-                                       a.get("min_score"), a.get("check_question", False))
+                                       a.get("min_score"), a.get("check_question", False), a.get("rules"))
             nodes += self.generator.nodes(limit)
         self.graph = Graph(nodes, given={"turn": Turn})
         self.warm_up()
@@ -96,7 +107,16 @@ class Pipeline:
         if self.reranker is not None:
             self.reranker.score_many([("warm up", self.reranker_pid)])
 
-    def query(self, turn: Turn) -> dict:
+    def query(self, turn: Turn, rewrite: str | None = None) -> dict:
+        """The length-gated query, or an LLM rewrite (configs `query.rewrite`): `short` rewrites the follow-ups
+        the gate would give history, `all` every follow-up. A first turn is used as it is."""
+        q = self.qcfg
+        rewrite = rewrite or q.get("rewrite", "off")
+        if rewrite == "off" or not turn.history or (rewrite == "short" and not needs_context(turn.query, q["short_words"])):
+            return self.gated_query(turn)
+        return {"query": rewrite_query(turn, llm.chat, q["history_turns"]) or self.gated_query(turn)["query"]}
+
+    def gated_query(self, turn: Turn) -> dict:
         q = self.qcfg
         return {"query": build_query(turn, "gated", q["history_turns"], q["max_words"], q["short_words"])}
 
@@ -162,13 +182,34 @@ class Pipeline:
         bm25 = self.bm25.search(query, self.rcfg["bm25_k"], domain, valid)
         return {"bm25": bm25, "dense": [], "candidates": bm25, "skipped": []}
 
-    def rerank(self, query: str, candidates: list[str]) -> dict:
-        """Cross-encoder order; top_score (the best candidate's score) gates answering, None without a rerank."""
-        if self.reranker is None or not candidates:
-            return {"ranked": candidates, "top_score": None}
+    def focus(self, query: str, turn: Turn, valid: np.ndarray | None) -> dict:
+        """The documents in the session's focus, and their best `k` passages (RRF of BM25 and dense)."""
+        if self.focus_cfg is None or not turn.focus_docs:
+            return {"focus_docs": [], "focus_pids": []}
+        mask = np.isin(self.doc_of, turn.focus_docs)
+        if valid is not None:
+            mask &= valid
+        k = self.focus_cfg["k"]
+        if not k:
+            return {"focus_docs": turn.focus_docs, "focus_pids": []}
+        bm25 = self.bm25.search(query, k, None, mask)
         with self.model_lock:
-            ranked, scores = self.reranker.rerank_scored(query, candidates)
-        return {"ranked": ranked, "top_score": scores[0]}
+            dense = self.dense.search(query, k, None, mask)
+        return {"focus_docs": turn.focus_docs, "focus_pids": rrf([bm25, dense], k=self.rcfg["rrf_k"])[:k]}
+
+    def rerank(self, query: str, candidates: list[str], focus_docs: list[str], focus_pids: list[str]) -> dict:
+        """Cross-encoder order of the candidates and the focus passages, with the session bonus added to
+        every passage of a focus document; top_score is the best raw score, None without a rerank."""
+        seen = set(candidates)
+        pool = candidates + [p for p in focus_pids if p not in seen]
+        if self.reranker is None or not pool:
+            return {"ranked": pool, "top_score": None}
+        with self.model_lock:
+            scores = self.reranker.score_many([(query, p) for p in pool])
+        bonus = self.focus_cfg["bonus"] if self.focus_cfg else 0.0
+        adjusted = [s + bonus * (self.by_pid[p].doc_id in focus_docs) for p, s in zip(pool, scores)]
+        order = sorted(range(len(pool)), key=lambda i: -adjusted[i])
+        return {"ranked": [pool[i] for i in order], "top_score": max(scores)}
 
     def run(self, turn: Turn) -> tuple[dict, Trace]:
         return self.graph.run(turn=turn)

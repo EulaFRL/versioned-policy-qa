@@ -87,8 +87,8 @@ def summarize(value: Any, limit: int = 200) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value[:limit] if isinstance(value, str) else value
     if isinstance(value, (list, tuple)):
-        head = [summarize(v, limit) for v in list(value)[:5]]
-        return head + [f"... {len(value)} items"] if len(value) > 5 else head
+        head = [summarize(v, limit) for v in list(value)[:10]]  # 10: every passage shown to the answer model
+        return head + [f"... {len(value)} items"] if len(value) > 10 else head
     if isinstance(value, dict):
         return {str(k): summarize(v, limit) for k, v in list(value.items())[:10]}
     if is_dataclass(value):

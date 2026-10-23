@@ -18,7 +18,7 @@ def stub_pipe(seen):
         return {"candidates": [p for i, p in enumerate(P) if valid is None or valid[i]]}
 
     return SimpleNamespace(by_pid=P, versioned=False, corpus_filter=corpus_filter, retrieve=retrieve,
-                           rerank=lambda q, c: {"ranked": c})
+                           rerank=lambda q, c, d, f: {"ranked": c})
 
 
 def scripted(replies):

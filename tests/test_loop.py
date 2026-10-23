@@ -1,0 +1,31 @@
+from vpqa.loop import attribute, bootstrap_diff, mcnemar, merge
+
+
+def test_merge_nested_and_lists():
+    cfg = {"answer": {"rules": ["a"], "passage_words": 400}, "route": {"threshold": {"first_turn": 0.9, "follow_up": 0.7}}}
+    out = merge(cfg, {"answer": {"rules": ["b", "a"]}, "route": {"threshold": {"follow_up": 0.9}}})
+    assert out["answer"] == {"rules": ["a", "b"], "passage_words": 400}
+    assert out["route"]["threshold"] == {"first_turn": 0.9, "follow_up": 0.9}
+    assert cfg["answer"]["rules"] == ["a"]  # not modified
+
+
+def test_attribute_order():
+    trace = lambda routed, ranked: {"<given>": {"turn": {"domain": "dmv"}}, "route": {"domain": routed},
+                                    "rerank": {"ranked": ranked}}
+    row = lambda outcome, final: {"outcome": outcome, "final_pids": final, "gold": ["g"]}
+    assert attribute(row("answered", ["g"]), trace("dmv", ["g"]), True, 5) is None
+    assert attribute(row("answered", ["x"]), trace("va", ["x"]), True, 5) == "intent"
+    assert attribute(row("answered", ["x"]), trace(None, ["x"] * 5 + ["g"]), True, 5) == "retrieval"
+    assert attribute(row("refused", []), trace("dmv", ["x", "g"]), True, 5) == "generation"
+    assert attribute(row("answered", ["x"]), trace("dmv", ["x"]), False, 5) == "knowledge gap"
+    assert attribute(row("refused", []), trace("dmv", ["x"]), False, 5) is None
+
+
+def test_mcnemar_and_bootstrap():
+    a = [True] * 10 + [False] * 10
+    b = [True] * 10 + [True] * 9 + [False]
+    only_a, only_b, p = mcnemar(a, b)
+    assert (only_a, only_b) == (0, 9) and p < 0.01
+    lo, hi = bootstrap_diff(a, b, samples=2000)
+    assert 0 < lo <= 0.45 <= hi
+    assert mcnemar(a, a) == (0, 0, 1.0)
