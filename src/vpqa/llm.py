@@ -6,6 +6,9 @@ the judging (the verifier and the evaluation judges), so a cheap answer model ca
 Responses are cached on disk by (model, messages, temperature), so reruns cost nothing and are reproducible.
 Each cached response keeps the token usage (and, on OpenRouter, the cost) of the call that produced it;
 TOTALS sums them over every call in this process, cached or not, so a rerun reports what the run cost.
+VPQA_CACHE sets the cache directory; an empty one samples the same run again (the models are not
+deterministic at temperature 0). A reply whose reasoning used up max_tokens before any text is asked again
+with four times the room, and cached under the original request.
 """
 from __future__ import annotations
 
@@ -19,7 +22,7 @@ from pathlib import Path
 
 import httpx
 
-CACHE = Path("data/cache/llm")
+CACHE = Path(os.environ.get("VPQA_CACHE", "data/cache/llm"))  # another directory: sample the same run again
 _LOCK = threading.Lock()
 TOTALS = {"calls": 0, "cached": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0, "cost_by_model": {}}
 
@@ -78,7 +81,10 @@ def complete(body: dict, cache: Path = CACHE) -> dict:
             message, usage = choice["message"], r.json().get("usage")
             if message.get("content") or message.get("tool_calls"):
                 break
-            if choice.get("finish_reason") == "length" or attempt >= 2:  # reasoning used up max_tokens: same again
+            if choice.get("finish_reason") == "length" and payload["max_tokens"] < 4 * body["max_tokens"]:
+                payload = {**payload, "max_tokens": 4 * body["max_tokens"]}  # reasoning used up the reply: more room
+                continue
+            if choice.get("finish_reason") == "length" or attempt >= 2:
                 break
         except (httpx.TransportError, httpx.HTTPStatusError) as e:
             if attempt == 19 or (isinstance(e, httpx.HTTPStatusError) and e.response.status_code != 429
