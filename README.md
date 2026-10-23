@@ -356,6 +356,49 @@ is slower in the tail: its answer call has a p50 of 5.2 s against 2.9 s, and 5 o
 rewrite ran past the 60 s budget and fell back to passage text; with 3 items rejected twice, that makes
 the 9% shown as passages.
 
+### Reusing verified answers across dates (eCFR)
+
+An organisation asks the same questions again, so a verified answer is worth keeping
+(`src/vpqa/memory.py`, `AnswerMemory`): a later question whose bge-m3 similarity to a stored one is at
+least τ gets the stored answer and its citations without running the pipeline. The risk is the one this
+project is about: the stored answer cites the versions in force when it was written. `bound` reuses an
+entry only if every passage it cites is in force on the new question's date, and otherwise runs the
+pipeline; `unbound` reuses on similarity alone. Answers without citations (clarifying questions) are not
+stored.
+
+Dev, the 135 eCFR pairs whose two items ask the same question (`scripts/eval_answer_memory.py`). The
+memory is filled by running the pipeline (DeepSeek V4 Flash answering, Sonnet verifying) on each question
+at its old date; 111 answers come out verified and cited (fill Cite-Hit 0.915). Each question is then
+asked again, paraphrased by the answer model (similarity to the original: p10 0.894, p50 0.966), at two
+dates: `same window`, another date on which the old gold version is still in force, where reuse is right;
+and `new version`, the pair's new date, where reuse cites the version that was replaced. Cite-Hit and
+Stale (a final citation not in force on the date) are over turns not refused.
+
+| Memory, τ 0.9 | Question date | Reused | Blocked as stale | Refused | Cite-Hit | Stale |
+|---|---|---|---|---|---|---|
+| none | same window | 0 | – | 0.259 | 0.850 | 0 |
+| unbound | same window | 0.719 | – | 0.141 | 0.897 | 0.026 |
+| bound | same window | 0.696 | 0.022 | 0.141 | 0.888 | 0 |
+| none | new version | 0 | – | 0.267 | 0.889 | 0 |
+| unbound | new version | 0.719 | – | 0.111 | 0.167 | 0.808 |
+| bound | new version | 0 | 0.719 | 0.267 | 0.889 | 0 |
+
+| Unbound, new version: Stale by τ | 0.8 | 0.85 | 0.9 | 0.95 |
+|---|---|---|---|---|
+| Reused | 0.837 | 0.785 | 0.719 | 0.533 |
+| Reused from another pair's question | 0.037 | 0.007 | 0 | 0 |
+| Stale | 0.883 | 0.848 | 0.808 | 0.632 |
+
+Within the window, reuse answers 7 in 10 questions with no LLM call and refuses fewer of them than a fresh
+run (0.14 against 0.26): the memory holds only answers the pipeline gave, and it answered the original
+wording more often than the paraphrase (0.82 against 0.74). After the regulation changed, reuse on similarity alone gives the
+replaced version's answer to 81% of answered questions; raising τ only trades reuse for staleness, since
+the question is the same and only its date differs. Binding the entry to the versions it cites removes
+every stale reuse at every τ and returns the no-memory result on new-version questions; in the window it
+also blocks the 2% of entries that cite a second passage which changed in the meantime, the case in which
+unbound reuse is stale even inside the gold version's window. τ 0.9 was chosen on these same items, so
+the full grid is in `runs/answer_memory/ecfr_dev.json`; the test split is not used. About 1 USD.
+
 ### Fixed DAG vs a ReAct agent
 
 Control group (`src/vpqa/pipeline/react.py`): the same model and the same retrieval and rerank, exposed
@@ -456,6 +499,95 @@ takes 3–6 s, the same budgets hold every turn to about 2 s (their sum is 1.95 
 falls back; the ranking then comes from BM25 alone, at R@5 0.38 instead of 0.54. Without budgets the
 fallbacks would never run and the CPU p95 would be 6.5 s.
 
+### Session memory and query rewriting
+
+A follow-up such as "and if I'm under 18?" names nothing, and a short follow-up's query only adds the
+last few utterances (the length gate). Two fixes, measured on retrieval (`scripts/eval_memory.py`):
+
+- **Session focus** (`memory.focus`, `src/vpqa/memory.py`): the session keeps the documents the last
+  `replies` replies cited. The best `k` passages of those documents (RRF of BM25 and dense) join the
+  rerank candidates, and every passage of a focus document gets `bonus` added to its rerank score. The
+  focus is a hint for ranking only; an answer still cites passages it was shown.
+- **LLM rewrite** (`query.rewrite`): the answer model (DeepSeek V4 Flash) rewrites the follow-up into a
+  standalone question, either only the short follow-ups the gate gives history (`short`) or every
+  follow-up (`all`).
+
+Each dialogue is replayed turn by turn. The document of a turn's top-ranked passage stands in for what
+its reply would cite (`system`). `oracle` uses the previous turn's gold document instead, an upper
+bound. The settings were picked on 200 train dialogues (1,224 answerable turns; replies 1–2, k 0/10,
+bonus 0–1). Train R@5: 0.571 without either fix, 0.580 with `short`, 0.583 with `all`, 0.621 with session
+focus, 0.628 with both. Validation, all 661 dialogues, 4,201 answerable turns:
+
+| Query | Session | R@1 | R@5 | MRR@20 | Follow-up, same document: R@5 | Follow-up, switches document: R@5 |
+|---|---|---|---|---|---|---|
+| gated | none | 0.224 | 0.549 | 0.368 | 0.539 | 0.591 |
+| gated | bonus only (k 0) | 0.246 | 0.567 | 0.384 | 0.568 | 0.591 |
+| gated | focus passages only (bonus 0) | 0.229 | 0.571 | 0.381 | 0.572 | 0.595 |
+| gated | focus (k 10, bonus 0.1) | 0.254 | **0.594** | 0.403 | 0.614 | 0.580 |
+| LLM rewrite (short) | none | 0.224 | 0.557 | 0.371 | 0.552 | 0.593 |
+| LLM rewrite (short) | focus | 0.261 | **0.603** | 0.410 | 0.627 | 0.582 |
+| gated | oracle focus | 0.310 | 0.644 | 0.456 | 0.702 | 0.560 |
+
+First turns (660) are 0.532 in every row. Follow-ups that stay on the previous turn's document (2,635)
+gain 7.5 points from session focus. Follow-ups that switch document (906) lose 1, because the bonus pulls
+toward the old document; the oracle, which is sure of the old document, loses 3 on them. The two parts
+add up: extra candidates or the bonus alone give about 2 points each, together 4.5. The LLM rewrite gives
+0.8 points R@5 on its own and 0.9 on top of the session, at 6.4 s p50 and 14.9 s p95 per rewritten turn,
+more than the whole retrieval budget, for 0.21 USD on validation. It stays off (`query.rewrite: "off"`).
+
+Session focus also stays off, despite the gain in recall. In the offline loop below, the same settings
+put gold in the top 5 on 12 more of 200 train turns, but end-to-end success does not rise.
+
+### Offline improvement loop
+
+`scripts/loop.py` (with `src/vpqa/loop.py`) changes the configuration only when a paired test says the
+change helps. Every failure on two frozen sets is put into one of four categories, decided in this order:
+**intent** (an answerable turn routed to another department), **retrieval** (no gold passage among the
+passages shown to the answer model), **generation** (a gold passage was shown, but the reply does not cite
+it or refuses), **knowledge gap** (a near-miss turn, which the documents do not cover, got an answer).
+Each round takes the largest category that still has untried patches in `configs/skills.yaml`. A patch
+changes configuration only (a parameter, or one rule line added to the answer prompt), so applying and
+rolling it back needs no code. The patch is run on the same turns. It is kept only if success on its
+target set rises with an exact McNemar p below 0.05 and success on the other set does not fall with p
+below 0.05; otherwise the configuration rolls back. A kept patch would then be run once on validation
+(300 turns, seed 0).
+
+Train, 200 answerable turns (seed 1) and their 117 near-miss rewrites; DeepSeek V4 Flash answering,
+Sonnet verifying. At the start: answerable success (answered, citing gold) 0.435, near-miss success (not
+answered) 0.880; failures: retrieval 94, generation 18, knowledge gap 14, intent 1.
+
+| Category | Patch | Target before → after | Only before / only after | p | 95% CI of gain | Guard before → after | p |
+|---|---|---|---|---|---|---|---|
+| retrieval | show 8 passages, not 5 | 0.435 → 0.405 | 18 / 12 | 0.36 | [−0.085, +0.025] | 0.880 → 0.889 | 1 |
+| retrieval | session focus (above; 2 replies, 10 passages, bonus 0.1) | 0.435 → 0.425 | 12 / 10 | 0.83 | [−0.055, +0.035] | 0.880 → 0.906 | 0.38 |
+| generation | passages cut at 800 words, not 400 | 0.435 → 0.435 | 0 / 0 | 1 | [0, 0] | 0.880 → 0.872 | 1 |
+| generation | 3 revisions, not 2 | 0.435 → 0.435 | 0 / 0 | 1 | [0, 0] | 0.880 → 0.880 | 1 |
+| generation | rule: cite the passage that states the answer | 0.435 → **0.335** | 24 / 4 | 0.0002 | [−0.150, −0.050] | 0.880 → 0.932 | 0.11 |
+| knowledge gap | rule: neighbouring case only → NOT_FOUND | 0.880 → **0.949** | 0 / 8 | 0.008 | [+0.026, +0.120] | 0.435 → **0.330** | 0.0001 |
+| knowledge gap | question check (second verifier call) | 0.880 → 0.889 | 0 / 1 | 1 | [0, +0.026] | 0.435 → 0.430 | 1 |
+| intent | route less often (thresholds 0.97 / 0.9) | 0.435 → 0.430 | 1 / 0 | 1 | [−0.015, 0] | 0.880 → 0.872 | 1 |
+| intent | no routing | 0.435 → 0.405 | 6 / 0 | 0.03 | [−0.055, −0.010] | 0.880 → 0.889 | 1 |
+
+No patch passed, so the configuration stays as it was and there is nothing to confirm on validation. The
+rejections are of three kinds:
+
+- **Moves failures between categories.** Both retrieval patches do what they are for: showing 8
+  passages cuts retrieval failures from 94 to 81, session focus to 82 (gold in the top 5 on 117 turns
+  instead of 105). Generation failures rise in step, from 18 to 37 and to 32: the model does not cite
+  the gold it is now shown, and the changed passages cost it turns it got right.
+- **Trades one set against the other.** The neighbouring-case rule refuses 8 more near-miss turns and
+  breaks none, a significant gain on its target set; but on the answerable set it loses 25 turns and gains
+  4 (refusals of answerable turns 49 → 87 of 200). A loop that only looked at the target category would
+  have kept it. The citation rule, aimed at generation, does the same (refusals 49 → 79): told to cite
+  only a passage that states the answer, the model more often finds none and refuses.
+- **Inert here.** Only 0.07% of MultiDoc2Dial passages are longer than 400 words, and 1 of 200 turns uses
+  both revisions, so the two parameter patches change no outcome. Turning routing off loses 6 turns: the
+  router's single intent failure is not worth the cost of searching every department.
+
+Retrieval is the largest category, but fixing retrieval alone does not raise success: the next work is in
+how the answer model uses a gold passage it is shown, judged end to end, not by retrieval recall. About
+3.8 USD.
+
 ### Replaying a run from its trace
 
 `scripts/replay_trace.py <trace> <run_id>` rebuilds the turn from the trace's first record, runs it
@@ -480,6 +612,10 @@ python scripts/eval_answers.py --dataset ecfr --split dev --n 100 --versions fil
 python scripts/eval_react.py --n 100                        # and --withhold gold-doc, --dataset ecfr
 python scripts/eval_fanout.py --k 5 10
 python scripts/eval_budgets.py --n 300                      # and --device cpu --scale none 1 0.5
+python scripts/eval_memory.py --split train --dialogues 200 --seed 0   # pick the session settings
+python scripts/eval_memory.py --split validation --rewrite off short --replies 2 --k 0 10 --bonus 0.0 0.1
+python scripts/eval_answer_memory.py --split dev
+python scripts/loop.py                                      # train n200 s1; confirms on validation if a patch passes
 ```
 
 The cheaper answer model: `VPQA_MODEL=deepseek/deepseek-v4-flash VPQA_JUDGE_MODEL=anthropic/claude-sonnet-5.5`,
@@ -497,8 +633,10 @@ src/vpqa/
   retrieval/   bm25, dense (bge-m3), RRF fusion, cross-encoder rerank
   pipeline/    the fixed DAG and the verifier
   eval/        metrics and the eval runner
+  memory.py    session focus and the version-bound answer memory
+  loop.py      failure attribution and paired tests for the offline loop
 scripts/       data download, index build, eval entry points
-configs/       run configs
+configs/       run configs; skills.yaml, the loop's patches by failure category
 tests/         unit tests for metrics and fusion
 ```
 
