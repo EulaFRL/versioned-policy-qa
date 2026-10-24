@@ -80,7 +80,19 @@ def mcnemar(a: list[bool], b: list[bool]) -> tuple[int, int, float]:
     return only_a, only_b, min(1.0, 2 * tail)
 
 
-def bootstrap_diff(a: list[bool], b: list[bool], samples: int = 10000, seed: int = 0) -> tuple[float, float]:
+def sign_flip(a: list[float], b: list[float], samples: int = 20000, seed: int = 0) -> tuple[int, int, float]:
+    """Paired test on per-turn success rates (each the mean over repeated samples): turns where A is higher,
+    turns where B is higher, and the two-sided p-value of a random sign-flip permutation test on b - a."""
+    d = [y - x for x, y in zip(a, b) if y != x]
+    only_a, only_b = sum(x < 0 for x in d), sum(x > 0 for x in d)
+    if not d:
+        return 0, 0, 1.0
+    rng, observed = random.Random(seed), abs(sum(d))
+    hits = sum(abs(sum(x if rng.random() < 0.5 else -x for x in d)) >= observed - 1e-9 for _ in range(samples))
+    return only_a, only_b, (hits + 1) / (samples + 1)
+
+
+def bootstrap_diff(a: list[float], b: list[float], samples: int = 10000, seed: int = 0) -> tuple[float, float]:
     """95% paired bootstrap interval of mean(b) - mean(a)."""
     rng, n = random.Random(seed), len(a)
     diffs = sorted(sum(b[i] - a[i] for i in (rng.randrange(n) for _ in range(n))) / n for _ in range(samples))

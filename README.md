@@ -368,31 +368,31 @@ stored.
 
 Dev, the 135 eCFR pairs whose two items ask the same question (`scripts/eval_answer_memory.py`). The
 memory is filled by running the pipeline (DeepSeek V4 Flash answering, Sonnet verifying) on each question
-at its old date; 111 answers come out verified and cited (fill Cite-Hit 0.915). Each question is then
-asked again, paraphrased by the answer model (similarity to the original: p10 0.894, p50 0.966), at two
+at its old date; 116 answers come out verified and cited (fill Cite-Hit 0.911). Each question is then
+asked again, paraphrased by the answer model (similarity to the original: p10 0.894, p50 0.965), at two
 dates: `same window`, another date on which the old gold version is still in force, where reuse is right;
 and `new version`, the pair's new date, where reuse cites the version that was replaced. Cite-Hit and
 Stale (a final citation not in force on the date) are over turns not refused.
 
 | Memory, τ 0.9 | Question date | Reused | Blocked as stale | Refused | Cite-Hit | Stale |
 |---|---|---|---|---|---|---|
-| none | same window | 0 | – | 0.259 | 0.850 | 0 |
-| unbound | same window | 0.719 | – | 0.141 | 0.897 | 0.026 |
-| bound | same window | 0.696 | 0.022 | 0.141 | 0.888 | 0 |
-| none | new version | 0 | – | 0.267 | 0.889 | 0 |
-| unbound | new version | 0.719 | – | 0.111 | 0.167 | 0.808 |
-| bound | new version | 0 | 0.719 | 0.267 | 0.889 | 0 |
+| none | same window | 0 | – | 0.185 | 0.845 | 0 |
+| unbound | same window | 0.756 | – | 0.111 | 0.883 | 0.025 |
+| bound | same window | 0.733 | 0.022 | 0.111 | 0.875 | 0 |
+| none | new version | 0 | – | 0.178 | 0.874 | 0 |
+| unbound | new version | 0.756 | – | 0.081 | 0.137 | 0.823 |
+| bound | new version | 0 | 0.756 | 0.178 | 0.874 | 0 |
 
 | Unbound, new version: Stale by τ | 0.8 | 0.85 | 0.9 | 0.95 |
 |---|---|---|---|---|
-| Reused | 0.837 | 0.785 | 0.719 | 0.533 |
-| Reused from another pair's question | 0.037 | 0.007 | 0 | 0 |
-| Stale | 0.883 | 0.848 | 0.808 | 0.632 |
+| Reused | 0.867 | 0.822 | 0.756 | 0.548 |
+| Reused from another pair's question | 0.030 | 0.007 | 0 | 0 |
+| Stale | 0.914 | 0.888 | 0.823 | 0.622 |
 
-Within the window, reuse answers 7 in 10 questions with no LLM call and refuses fewer of them than a fresh
-run (0.14 against 0.26): the memory holds only answers the pipeline gave, and it answered the original
-wording more often than the paraphrase (0.82 against 0.74). After the regulation changed, reuse on similarity alone gives the
-replaced version's answer to 81% of answered questions; raising τ only trades reuse for staleness, since
+Within the window, reuse answers 3 in 4 questions with no LLM call and refuses fewer of them than a fresh
+run (0.11 against 0.19): the memory holds only answers the pipeline gave, and it answered the original
+wording more often than the paraphrase (0.86 against 0.82). After the regulation changed, reuse on
+similarity alone gives the replaced version's answer to 82% of answered questions; raising τ only trades reuse for staleness, since
 the question is the same and only its date differs. Binding the entry to the versions it cites removes
 every stale reuse at every τ and returns the no-memory result on new-version questions; in the window it
 also blocks the 2% of entries that cite a second passage which changed in the meantime, the case in which
@@ -556,37 +556,46 @@ Train, 200 answerable turns (seed 1) and their 117 near-miss rewrites; DeepSeek 
 Sonnet verifying. At the start: answerable success (answered, citing gold) 0.435, near-miss success (not
 answered) 0.880; failures: retrieval 94, generation 18, knowledge gap 14, intent 1.
 
+The answer model is not deterministic at temperature 0, so a patch's flips include sampling noise. The
+same configuration, sampled again with an empty cache (`VPQA_CACHE`), gives answerable 0.435 → 0.420
+(7 / 4 turns, p 0.55) and near-miss 0.880 → 0.846 (8 / 4, p 0.39): about 12 of 200 turns change with no
+change at all, so an effect of 2–3 points cannot be told apart on these sets. A reply whose reasoning uses
+up its token budget before any text is asked again with four times the room (`src/vpqa/llm.py`); an empty
+reply would otherwise count as a refusal, and a configuration run for the first time would look worse than
+one whose empty replies earlier runs had already retried.
+
 | Category | Patch | Target before → after | Only before / only after | p | 95% CI of gain | Guard before → after | p |
 |---|---|---|---|---|---|---|---|
-| retrieval | show 8 passages, not 5 | 0.435 → 0.405 | 18 / 12 | 0.36 | [−0.085, +0.025] | 0.880 → 0.889 | 1 |
-| retrieval | session focus (above; 2 replies, 10 passages, bonus 0.1) | 0.435 → 0.425 | 12 / 10 | 0.83 | [−0.055, +0.035] | 0.880 → 0.906 | 0.38 |
+| retrieval | show 8 passages, not 5 | 0.435 → 0.450 | 10 / 13 | 0.68 | [−0.030, +0.060] | 0.880 → 0.838 | 0.30 |
+| retrieval | session focus (above; 2 replies, 10 passages, bonus 0.1) | 0.435 → 0.430 | 11 / 10 | 1 | [−0.050, +0.040] | 0.880 → 0.872 | 1 |
 | generation | passages cut at 800 words, not 400 | 0.435 → 0.435 | 0 / 0 | 1 | [0, 0] | 0.880 → 0.872 | 1 |
 | generation | 3 revisions, not 2 | 0.435 → 0.435 | 0 / 0 | 1 | [0, 0] | 0.880 → 0.880 | 1 |
-| generation | rule: cite the passage that states the answer | 0.435 → **0.335** | 24 / 4 | 0.0002 | [−0.150, −0.050] | 0.880 → 0.932 | 0.11 |
-| knowledge gap | rule: neighbouring case only → NOT_FOUND | 0.880 → **0.949** | 0 / 8 | 0.008 | [+0.026, +0.120] | 0.435 → **0.330** | 0.0001 |
+| generation | rule: cite the passage that states the answer | 0.435 → **0.385** | 14 / 4 | 0.03 | [−0.090, −0.010] | 0.880 → 0.863 | 0.75 |
+| knowledge gap | rule: neighbouring case only → NOT_FOUND | 0.880 → 0.932 | 1 / 7 | 0.07 | [+0.009, +0.103] | 0.435 → **0.390** | 0.049 |
 | knowledge gap | question check (second verifier call) | 0.880 → 0.889 | 0 / 1 | 1 | [0, +0.026] | 0.435 → 0.430 | 1 |
 | intent | route less often (thresholds 0.97 / 0.9) | 0.435 → 0.430 | 1 / 0 | 1 | [−0.015, 0] | 0.880 → 0.872 | 1 |
-| intent | no routing | 0.435 → 0.405 | 6 / 0 | 0.03 | [−0.055, −0.010] | 0.880 → 0.889 | 1 |
+| intent | no routing | 0.435 → 0.415 | 4 / 0 | 0.13 | [−0.040, −0.005] | 0.880 → 0.880 | 1 |
 
 No patch passed, so the configuration stays as it was and there is nothing to confirm on validation. The
 rejections are of three kinds:
 
 - **Moves failures between categories.** Both retrieval patches do what they are for: showing 8
   passages cuts retrieval failures from 94 to 81, session focus to 82 (gold in the top 5 on 117 turns
-  instead of 105). Generation failures rise in step, from 18 to 37 and to 32: the model does not cite
-  the gold it is now shown, and the changed passages cost it turns it got right.
-- **Trades one set against the other.** The neighbouring-case rule refuses 8 more near-miss turns and
-  breaks none, a significant gain on its target set; but on the answerable set it loses 25 turns and gains
-  4 (refusals of answerable turns 49 → 87 of 200). A loop that only looked at the target category would
-  have kept it. The citation rule, aimed at generation, does the same (refusals 49 → 79): told to cite
-  only a passage that states the answer, the model more often finds none and refuses.
+  instead of 105). Generation failures rise in step, from 18 to 28 and to 31, and the net change is inside
+  the noise above (13 / 10 and 10 / 11 turns). Showing 8 passages also answers 5 more near-miss turns:
+  more text gives the model more to answer from, whether or not it covers the question.
+- **Trades one set against the other.** The neighbouring-case rule refuses 7 more near-miss turns and
+  breaks 1, not significant on its own set; on the answerable set it loses 13 turns and gains 4 (p 0.049;
+  refusals of answerable turns 48 → 62 of 200). The citation rule, aimed at generation, loses 14 and gains
+  4 (refusals 48 → 56): told to cite only a passage that states the answer, the model more often finds
+  none and refuses.
 - **Inert here.** Only 0.07% of MultiDoc2Dial passages are longer than 400 words, and 1 of 200 turns uses
-  both revisions, so the two parameter patches change no outcome. Turning routing off loses 6 turns: the
-  router's single intent failure is not worth the cost of searching every department.
+  both revisions, so the two parameter patches change no outcome. Turning routing off loses 4 turns and
+  gains none: the router's single intent failure is not worth the cost of searching every department.
 
 Retrieval is the largest category, but fixing retrieval alone does not raise success: the next work is in
-how the answer model uses a gold passage it is shown, judged end to end, not by retrieval recall. About
-3.8 USD.
+how the answer model uses a gold passage it is shown, judged end to end, not by retrieval recall, and on
+sets large enough, or sampled more than once, to see effects smaller than the noise above. About 4 USD.
 
 ### Replaying a run from its trace
 
