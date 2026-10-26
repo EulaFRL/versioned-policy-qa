@@ -1,4 +1,4 @@
-from vpqa.loop import attribute, bootstrap_diff, mcnemar, merge
+from vpqa.loop import attribute, bootstrap_diff, mcnemar, merge, sign_flip
 
 
 def test_merge_nested_and_lists():
@@ -29,3 +29,13 @@ def test_mcnemar_and_bootstrap():
     lo, hi = bootstrap_diff(a, b, samples=2000)
     assert 0 < lo <= 0.45 <= hi
     assert mcnemar(a, a) == (0, 0, 1.0)
+
+
+def test_sign_flip_matches_mcnemar_on_single_samples():
+    a = [1.0] * 14 + [0.0] * 4 + [1.0] * 50 + [0.0] * 132
+    b = [0.0] * 14 + [1.0] * 4 + [1.0] * 50 + [0.0] * 132
+    only_a, only_b, p = sign_flip(a, b)
+    assert (only_a, only_b) == (14, 4) and abs(p - mcnemar([x == 1 for x in a], [x == 1 for x in b])[2]) < 0.005
+    assert sign_flip(a, a) == (0, 0, 1.0)
+    # means over samples: a turn that rose from 1/3 to 2/3 counts once
+    assert sign_flip([1 / 3, 1.0], [2 / 3, 1.0])[:2] == (0, 1)

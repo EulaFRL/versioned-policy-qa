@@ -597,6 +597,30 @@ Retrieval is the largest category, but fixing retrieval alone does not raise suc
 how the answer model uses a gold passage it is shown, judged end to end, not by retrieval recall, and on
 sets large enough, or sampled more than once, to see effects smaller than the noise above. About 4 USD.
 
+**Repeated samples.** `--samples k` runs each configuration k times, each sample after the first with its
+own empty cache. A turn's success is then its mean over the samples, and the paired test is a sign-flip
+permutation test on those means (for k = 1 it gives the McNemar p). "Only before / only after" counts
+the turns whose mean fell or rose. The two retrieval patches, which do what they are for, were run again:
+
+| Samples | Patch | Target before → after | Only before / only after | p | 95% CI of gain | Guard before → after | p |
+|---|---|---|---|---|---|---|---|
+| 3 | show 8 passages | 0.430 → 0.438 | 18 / 19 | 0.73 | [−0.028, +0.047] | 0.869 → 0.849 | 0.48 |
+| 3 | session focus | 0.430 → 0.460 | 13 / 15 | 0.12 | [−0.005, +0.067] | 0.869 → 0.863 | 0.85 |
+| 5 | session focus | 0.418 → **0.464** | 11 / 23 | 0.006 | [+0.015, +0.080] | 0.867 → 0.855 | 0.40 |
+
+The five samples of the starting configuration range from 0.385 to 0.435 on the answerable set, those of
+session focus from 0.430 to 0.485. Session focus was taken to five samples after the three-sample result,
+a choice made on the data, so its p is optimistic; the loop's confirmation on validation (300 answerable
+turns, seed 0, and their 174 near-miss rewrites; 3 samples each) is the test that counts:
+
+| Validation, 3 samples | Start | Session focus | Only start / only focus | p | 95% CI of gain |
+|---|---|---|---|---|---|
+| answerable | 0.384 | 0.398 | 16 / 24 | 0.36 | [−0.012, +0.039] |
+| near-miss | 0.793 | 0.805 | 8 / 13 | 0.47 | [−0.013, +0.036] |
+
+The gain does not hold up, so session focus stays off. Its effect on end-to-end success, if any, is
+smaller than these sets can show, though it raises retrieval recall clearly (above). About 3.6 USD.
+
 ### Replaying a run from its trace
 
 `scripts/replay_trace.py <trace> <run_id>` rebuilds the turn from the trace's first record, runs it
@@ -625,6 +649,7 @@ python scripts/eval_memory.py --split train --dialogues 200 --seed 0   # pick th
 python scripts/eval_memory.py --split validation --rewrite off short --replies 2 --k 0 10 --bonus 0.0 0.1
 python scripts/eval_answer_memory.py --split dev
 python scripts/loop.py                                      # train n200 s1; confirms on validation if a patch passes
+python scripts/loop.py --samples 5 --confirm-samples 3 --only session-focus --out runs/loop_k3
 ```
 
 The cheaper answer model: `VPQA_MODEL=deepseek/deepseek-v4-flash VPQA_JUDGE_MODEL=anthropic/claude-sonnet-5.5`,
