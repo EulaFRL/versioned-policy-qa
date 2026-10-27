@@ -183,7 +183,7 @@ Outcomes: different provision 165, declined 324, kept 277, a version could not a
 version's validity window, whose gold passage is the version in force on that date. Splits are by
 section: dev 135 questions (270 items, 89 sections), test 142 questions (284 items, 84 sections). All
 LLM steps use claude-sonnet-5.5 at temperature 0; the set cost about 9 USD including pilot runs. The
-test split is held out until the end of the project.
+test split was held out until the end of the project and run once.
 
 **Spot check.** 30 questions drawn at random before the same-provision check was added were read against
 both texts. The check removes the 3 that compare unrelated rules. Of the other 27, two questions give
@@ -216,13 +216,27 @@ depth, since only two or three versions of a paragraph compete; postfilter:20 lo
 because some of its 20 candidates are dropped. Without the reranker, prefilter reaches R@1 0.433 and
 unaware 0.200.
 
+Test split, 284 items, run once at the end with the same settings, RRF + rerank:
+
+| Policy | R@1 | R@5 | R@10 | Key@5 | Stale@1 | Invalid@5 | R@1 old | R@1 new |
+|---|---|---|---|---|---|---|---|---|
+| unaware | 0.264 | 0.842 | 0.937 | 0.937 | 0.299 | 0.495 | 0.282 | 0.246 |
+| latest | 0.236 | 0.401 | 0.408 | 0.845 | 0.271 | 0.412 | 0.000 | 0.472 |
+| prefilter | 0.549 | 0.944 | 0.965 | 0.944 | 0 | 0 | 0.528 | 0.570 |
+| postfilter:20 | 0.549 | 0.944 | 0.951 | 0.944 | 0 | 0 | 0.528 | 0.570 |
+| prefilter, depth 100 | **0.553** | **0.951** | **0.975** | 0.951 | 0 | 0 | 0.535 | 0.570 |
+| postfilter:100 | **0.553** | **0.951** | **0.975** | 0.951 | 0 | 0 | 0.535 | 0.570 |
+
+The dev findings hold: filtering by date doubles R@1 (0.264 to 0.549) and removes stale top passages,
+`latest` fails every past-dated question, and pre- and postfiltering tie at equal depth.
+
 Reproduce:
 
 ```
 python scripts/build_ecfr.py
 python scripts/make_version_qa.py          # needs VPQA_API_BASE / VPQA_API_KEY / VPQA_MODEL
 python scripts/eval_versions.py --split dev --rerank \
-    --policy unaware latest prefilter postfilter:20 prefilter:100 postfilter:100
+    --policy unaware latest prefilter postfilter:20 prefilter:100 postfilter:100   # and --split test
 ```
 
 ### Cited answers on MultiDoc2Dial
@@ -355,6 +369,24 @@ With DeepSeek answering (verifier still Sonnet), the filtered pipeline costs a t
 is slower in the tail: its answer call has a p50 of 5.2 s against 2.9 s, and 5 of 100 answer calls and 1
 rewrite ran past the 60 s budget and fell back to passage text; with 3 items rejected twice, that makes
 the 9% shown as passages.
+
+Test split, all 284 items, run once at the end, DeepSeek answering, Sonnet verifying and judging:
+
+| Versions | First answer cites a version not in force | Of those, rejected | Final cites one | Final Cite-Hit | Answered / refused / passages | Final is a clarifying question | Latency p50 / p95 | Cost per item |
+|---|---|---|---|---|---|---|---|---|
+| filter | 0 | – | 0 | 0.925 | 0.92 / 0.07 / 0.02 | 0.014 | 8.1 s / 47.5 s | 0.003 USD |
+| unaware | 0.685 | 1.00 | 0.068 | 0.608 | 0.69 / 0.22 / 0.09 | 0.201 | 13.7 s / 60.5 s | 0.002 USD |
+| inject | 0.507 | 1.00 | 0.053 | 0.504 | 0.85 / 0.08 / 0.08 | 0.363 | 16.2 s / 61.2 s | 0.002 USD |
+
+The filtered pipeline matches dev; it shows fewer items as passages than the dev DeepSeek row (2% against
+9%) because a reply whose reasoning used up its token budget is now asked again with more room (the dev
+row predates that). With stale versions in the context, DeepSeek behaves differently from Sonnet: rather
+than citing both versions, it often asks which date applies, since the answer prompt does not show the
+question's date. Such a reply cites nothing, so it counts as a miss for Cite-Hit, and the rewrite after a
+rejected stale citation turns more answers into questions (first answers 53 in `inject`, final 103). The
+verifier still rejects every stale citation, but 5–7% of final answers keep one, against 1–2% with Sonnet
+on dev. Clarifying questions skip the verifier, which is why those rows cost less. Filtering at retrieval
+is what keeps the answers right; the verifier alone does not.
 
 ### Reusing verified answers across dates (eCFR)
 
@@ -642,6 +674,7 @@ python scripts/select_refusal_gate.py --train-n 1000
 python scripts/make_near_miss.py --split validation --n 300 --seed 0   # the files in data/benchmark are these
 python scripts/eval_answers.py --dataset md2d --n 300 --withhold near-miss
 python scripts/eval_answers.py --dataset ecfr --split dev --n 100 --versions filter   # or unaware / inject
+python scripts/eval_answers.py --dataset ecfr --split test --n 284 --versions filter  # or unaware / inject
 python scripts/eval_react.py --n 100                        # and --withhold gold-doc, --dataset ecfr
 python scripts/eval_fanout.py --k 5 10
 python scripts/eval_budgets.py --n 300                      # and --device cpu --scale none 1 0.5
