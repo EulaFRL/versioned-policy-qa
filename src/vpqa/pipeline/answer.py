@@ -38,6 +38,22 @@ FEEDBACK = """A check of your answer found these problems:
 
 Rewrite the answer under the same rules. Correct or drop every statement the cited passages do not support, and end every statement with its citations. If what remains does not answer the message, reply with exactly {not_found}."""
 
+CONDITIONS = """Below are numbered passages and a user's message to a public agency's help desk.
+
+List the conditions in the latest message that narrow whom or which case it is about: an age, a place of residence, a status, a program, a date, an amount, a kind of document, and the like. For each, say whether some passage explicitly covers that exact condition, and whether the answer to the message depends on it. Reply with JSON only:
+{{"conditions": [{{"condition": "...", "covered": true, "essential": true}}]}}
+Use an empty list if the message states no such condition.
+
+Passages:
+{passages}
+
+Conversation so far:
+{history}
+
+Latest user message: {query}"""
+
+UNCOVERED = "The passages do not mention these conditions from the user's message: {conditions}. If the answer depends on them, reply with exactly {not_found}."
+
 _CLAIM = re.compile(r"(.*?)((?:\s*\[\d+\])+)[.!?]?", re.S)
 _CITE = re.compile(r"\[(\d+)\]")
 
@@ -58,14 +74,37 @@ def passage_label(p: Passage) -> str:
     return f"({p.doc_id}, in force from {p.effective_from}{until}) "
 
 
+def _shown(passages: list[Passage], passage_words: int) -> str:
+    return "\n\n".join(f"[{i}] {passage_label(p)}{' '.join(p.text.split()[:passage_words])}"
+                       for i, p in enumerate(passages, 1))
+
+
+def _history(turn: Turn, history_turns: int) -> str:
+    return "\n".join(turn.history[-history_turns:]) if turn.history and history_turns else "(none)"
+
+
 def build_prompt(turn: Turn, passages: list[Passage], history_turns: int = 4, passage_words: int = 400,
                  rules: list[str] | None = None) -> str:
     """The answer prompt; `rules` are extra lines appended to the rule list (configs `answer.rules`)."""
-    shown = "\n\n".join(f"[{i}] {passage_label(p)}{' '.join(p.text.split()[:passage_words])}"
-                        for i, p in enumerate(passages, 1))
-    history = "\n".join(turn.history[-history_turns:]) if turn.history and history_turns else "(none)"
     extra = "".join(f"\n- {r}" for r in rules or [])
-    return PROMPT.format(not_found=NOT_FOUND, passages=shown, history=history, query=turn.query, rules=extra)
+    return PROMPT.format(not_found=NOT_FOUND, passages=_shown(passages, passage_words),
+                         history=_history(turn, history_turns), query=turn.query, rules=extra)
+
+
+def condition_messages(turn: Turn, passages: list[Passage], history_turns: int = 4,
+                       passage_words: int = 400) -> list[dict]:
+    """Ask which conditions of the message the passages cover (configs `answer.condition_check`)."""
+    return [{"role": "user", "content": CONDITIONS.format(passages=_shown(passages, passage_words),
+                                                          history=_history(turn, history_turns), query=turn.query)}]
+
+
+def uncovered(reply: dict | None, essential_only: bool = False) -> list[str]:
+    """The conditions a condition check found no passage for; [] if the reply is malformed."""
+    items = (reply or {}).get("conditions")
+    if not isinstance(items, list):
+        return []
+    return [str(c.get("condition", "")).strip() for c in items
+            if isinstance(c, dict) and c.get("covered") is False and (c.get("essential") is not False or not essential_only)]
 
 
 def parse(reply: str, pids: list[str]) -> Parsed:

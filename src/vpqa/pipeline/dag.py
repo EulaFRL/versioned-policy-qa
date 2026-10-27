@@ -96,7 +96,8 @@ class Pipeline:
             a = cfg.get("answer", {})
             self.generator = Generator(self.by_pid, llm.chat, llm.judge_json, self.rcfg["top_n"],
                                        a.get("max_revisions", 2), a.get("history_turns", 4), a.get("passage_words", 400),
-                                       a.get("min_score"), a.get("check_question", False), a.get("rules"))
+                                       a.get("min_score"), a.get("check_question", False), a.get("rules"),
+                                       a.get("condition_check", "off"), llm.chat_json)
             nodes += self.generator.nodes(limit)
         self.graph = Graph(nodes, given={"turn": Turn})
         self.warm_up()

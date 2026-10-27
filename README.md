@@ -653,6 +653,29 @@ turns, seed 0, and their 174 near-miss rewrites; 3 samples each) is the test tha
 The gain does not hold up, so session focus stays off. Its effect on end-to-end success, if any, is
 smaller than these sets can show, though it raises retrieval recall clearly (above). About 3.6 USD.
 
+**Condition check.** The neighbouring-case rule asks the answer model to notice by itself that the passages
+cover a different case. The condition check makes that a separate step: one more call to the answer model
+lists the conditions in the user's message that narrow the case (an age, a residence, a status, a program,
+a date, an amount, a kind of document), and for each whether a passage explicitly covers it and whether the
+answer depends on it (`answer.condition_check`). Three strengths: `note` names the uncovered conditions in
+the answer prompt and lets the model decide; `essential` refuses when a condition the answer depends on is
+uncovered; `any` refuses when any condition is uncovered. Train, 3 samples each:
+
+| Patch | Near-miss before → after | Only before / only after | p | Answerable before → after | Only before / only after | p |
+|---|---|---|---|---|---|---|
+| condition check, note | 0.866 → 0.917 | 0 / 14 | <0.001 | 0.430 → 0.418 | 5 / 0 | 0.06 |
+| condition check, essential | 0.866 → 0.903 | 0 / 12 | 0.001 | 0.430 → **0.417** | 6 / 0 | 0.03 |
+| condition check, any | 0.866 → 0.920 | 0 / 15 | <0.001 | 0.430 → **0.408** | 8 / 0 | 0.008 |
+
+`note` passed once; run again, it lost 6 answerable turns instead of 5 (p 0.03) and failed, so it sits on
+the threshold. On validation (3 samples) it refuses 32 more near-miss turns and breaks none (0.793 → 0.889,
+p <0.001), and loses 6 answerable turns and gains none (0.384 → 0.377, p 0.03): rejected, and the
+configuration stays as it was. It is the best trade of the refusal patches tried: about 10 points of
+near-miss refusal for under 1 point of answerable success, where the neighbouring-case rule gave 5 for 4.
+The guard here only asks whether the answerable set is significantly worse, and a loss of a few turns in
+the same direction on every sample is; a non-inferiority margin (say, at most 2 points lost) would accept
+it, which is a product decision rather than a statistical one. About 1.5 USD.
+
 ### Replaying a run from its trace
 
 `scripts/replay_trace.py <trace> <run_id>` rebuilds the turn from the trace's first record, runs it
