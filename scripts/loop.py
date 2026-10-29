@@ -12,7 +12,7 @@ near-miss rewrites (scripts/make_near_miss.py). Each round:
 3. run the current configuration plus each of its patches on the same turns. The patch's target set is
    the near-miss set for knowledge gaps and the answerable set otherwise; the other set is its guard.
    A patch passes if success on the target set rises with an exact McNemar p below `--alpha` and success
-   on the guard set does not fall with p below `--alpha`;
+   on the guard set does not fall materially: by more than `--margin` with p below `--alpha`;
 4. keep the passing patch with the largest gain and make it the current configuration; if none passes,
    the configuration stays as it was (rollback) and the category is marked tried.
 
@@ -38,7 +38,7 @@ from pathlib import Path
 
 import yaml
 
-from vpqa.loop import CATEGORIES, attribute, bootstrap_diff, mcnemar, merge, read_trace, sign_flip, success
+from vpqa.loop import CATEGORIES, attribute, bootstrap_diff, mcnemar, merge, passes, read_trace, sign_flip, success
 
 
 def evaluate(cfg: dict, split: str, n: int, seed: int, out: Path, workers: int, sample: int = 0) -> dict:
@@ -91,6 +91,7 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--alpha", type=float, default=0.05)
+    ap.add_argument("--margin", type=float, default=0.02, help="guard drop (fraction of turns) that counts as harm")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--samples", type=int, default=1, help="runs of each configuration (see above)")
     ap.add_argument("--only", default="", help="comma-separated patch names to try (default: all)")
@@ -118,7 +119,7 @@ def main() -> None:
     def run(cfg: dict, split: str, n: int, seed: int, samples: int = args.samples) -> dict:
         return outcomes([evaluate(cfg, split, n, seed, args.out, args.workers, i) for i in range(samples)], top_n(cfg))
 
-    report = [f"# Offline loop on {args.split} (n {args.n}, seed {args.seed}; alpha {args.alpha}; "
+    report = [f"# Offline loop on {args.split} (n {args.n}, seed {args.seed}; alpha {args.alpha}, margin {args.margin}; "
               f"{args.samples} sample{'s' if args.samples > 1 else ''})", ""]
     for rnd in range(1, len(CATEGORIES) + 1):
         base = run(current, args.split, args.n, args.seed)
@@ -142,7 +143,7 @@ def main() -> None:
             cfg = merge(current, skill["patch"])
             res = run(cfg, args.split, args.n, args.seed)
             t, g = compare(base, res, target), compare(base, res, guard)
-            ok = t["only_b"] > t["only_a"] and t["p"] < args.alpha and not (g["only_a"] > g["only_b"] and g["p"] < args.alpha)
+            ok = passes(t, g, args.alpha, args.margin)
             log({"round": rnd, "category": cat, "skill": skill["name"], "patch": skill["patch"], "target": t, "guard": g,
                  "passed": ok, "failures_after": dict(res["answerable categories"] + res["near-miss categories"])})
             report.append(f"| {skill['name']} | {t['a']:.3f} → {t['b']:.3f} | {t['only_a']} / {t['only_b']} | {t['p']:.3g} | "

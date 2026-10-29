@@ -97,3 +97,12 @@ def bootstrap_diff(a: list[float], b: list[float], samples: int = 10000, seed: i
     rng, n = random.Random(seed), len(a)
     diffs = sorted(sum(b[i] - a[i] for i in (rng.randrange(n) for _ in range(n))) / n for _ in range(samples))
     return diffs[int(0.025 * samples)], diffs[int(0.975 * samples) - 1]
+
+
+def passes(target: dict, guard: dict, alpha: float, margin: float) -> bool:
+    """A patch passes if success on its target set rises with p below `alpha`, and success on its guard set does
+    not fall materially: the guard rejects only a drop that is both significant (p below `alpha`) and larger than
+    `margin` (a fraction of turns). Not a non-inferiority test: a large drop that is not significant passes."""
+    gain = target["only_b"] > target["only_a"] and target["p"] < alpha
+    harm = guard["only_a"] > guard["only_b"] and guard["p"] < alpha and guard["a"] - guard["b"] > margin
+    return gain and not harm

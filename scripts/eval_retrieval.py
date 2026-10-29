@@ -10,10 +10,13 @@ only for utterances of at most W words). See vpqa.retrieval.query.build_query.
 
 `--rerank N` reorders the top N of the RRF list with the cross-encoder and leaves the rest in place.
 Every candidate is scored once and cached under runs/rerank_cache/, so several N cost one pass.
-`--rerank-query` gives the cross-encoder a different query mode from the retrievers.
+`--rerank-query` gives the cross-encoder a different query mode from the retrievers, `--rerank-model` a
+different cross-encoder (scripts/train_reranker.py; its scores get their own cache).
 
 `--route router` restricts BM25 and dense to the domain predicted by the router from
 scripts/train_router.py when it is confident; `--route oracle` uses the gold domain (an upper bound).
+
+Besides `<split>.json`, the top 10 of every run per turn go to `<split>.ranked.json` for paired tests.
 
 `--unit` picks the retrieval unit (vpqa.data.multidoc2dial). Besides R@k, every run reports Hit@k (any
 gold passage in the top k, the paper's metric) and Ctx@W, the share of gold grounding spans inside the
@@ -73,6 +76,7 @@ def main() -> None:
     ap.add_argument("--methods", nargs="+", default=["bm25", "dense", "rrf"])
     ap.add_argument("--rerank", nargs="*", type=int, default=[], help="rerank the top N of RRF")
     ap.add_argument("--rerank-query", help="query mode for the cross-encoder (default: same as retrieval)")
+    ap.add_argument("--rerank-model", help="cross-encoder to rerank with (default: the config's), e.g. a fine-tuned one")
     ap.add_argument("--route", choices=["none", "router", "oracle"], default="none")
     ap.add_argument("--router", default="runs/router/router.pkl")
     ap.add_argument("--out", default="runs/retrieval")
@@ -94,7 +98,9 @@ def main() -> None:
         unit = "" if args.unit == "section" else f"__{args.unit}"
         dense = DenseIndex(passages, name, cache=Path("data/index") / f"{name.replace('/', '__')}{unit}.npy")
 
-    reranker = Reranker(passages, rcfg["model"]) if args.rerank else None
+    rerank_model = args.rerank_model or rcfg["model"]
+    reranker = Reranker(passages, rerank_model) if args.rerank else None
+    cache_name = args.split + ("" if rerank_model == rcfg["model"] else "__" + rerank_model.strip("/").replace("/", "__"))
 
     def queries_for(spec: str) -> list[str]:
         mode, _, n = spec.partition(":")
@@ -104,7 +110,7 @@ def main() -> None:
             history_turns = int(n) if mode != "gated" else history_turns
         return [build_query(t, mode, history_turns, qcfg["max_words"], short_words) for t in turns]
 
-    results, latency, routing = {}, {}, {}
+    results, latency, routing, top10 = {}, {}, {}, {}
     domains: list[str | None] = [None] * len(turns)
     if args.route == "oracle":
         domains = [t.domain for t in turns]
@@ -140,11 +146,12 @@ def main() -> None:
             rspec = args.rerank_query or spec
             rqueries = queries if rspec == spec else queries_for(rspec)
             scores = rerank_scores(reranker, rqueries, ranked["rrf"],
-                                   Path("runs/rerank_cache") / f"{args.split}.json")
+                                   Path("runs/rerank_cache") / f"{cache_name}.json")
             for n in args.rerank:
                 name = f"rrf+rerank@{n}" + (f"[{rspec}]" if rspec != spec else "")
                 ranked[name] = [sorted(c[:n], key=lambda p: -s[p]) + c[n:] for c, s in zip(ranked["rrf"], scores)]
                 results[f"{name}/{spec}{suffix}"] = breakdown(ranked[name], turns, ctx)
+                top10[f"{name}/{spec}{suffix}"] = [r[:10] for r in ranked[name]]
             n = max(args.rerank)
             t0 = time.perf_counter()
             for q, c in zip(rqueries[:100], ranked["rrf"][:100]):  # one query at a time
@@ -153,11 +160,14 @@ def main() -> None:
         latency[spec] = lat
         for m in args.methods:
             results[f"{m}/{spec}{suffix}"] = breakdown(ranked[m], turns, ctx)
+            top10[f"{m}/{spec}{suffix}"] = [r[:10] for r in ranked[m]]
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / f"{args.split}.json").write_text(
         json.dumps({"results": results, "latency": latency, "routing": routing}, indent=2))
+    (out / f"{args.split}.ranked.json").write_text(json.dumps(
+        {"ids": [f"{t.dialog_id}/{t.turn_id}" for t in turns], "gold": [t.gold_pids for t in turns], "ranked": top10}))
 
     print(f"\n| run | " + " | ".join(f"R@{k}" for k in KS) + " | MRR@20 | follow-up R@5 | question R@5 |")
     print("|---" * (len(KS) + 4) + "|")

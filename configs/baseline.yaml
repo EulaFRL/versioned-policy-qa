@@ -25,6 +25,8 @@ answer:
   history_turns: 4    # utterances shown to the answer model
   passage_words: 400  # each of the top_n passages is cut to this many words
   max_revisions: 2    # verifier rejects -> rewrite with its problems, at most this often -> show passage text
+  condition_check: note  # one more call lists the message's conditions; uncovered ones are named in the answer
+                        # prompt (off | note | essential | any; scripts/loop.py, configs/skills.yaml)
 memory:
   # session focus: the best k passages of the documents the last `replies` replies cited join the rerank
   # candidates, and every passage of those documents gets `bonus` on its rerank score (scripts/eval_memory.py).

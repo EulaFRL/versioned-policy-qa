@@ -12,6 +12,8 @@ Version policies:
   the as-of date;
 - `postfilter:N`: each retriever returns its top N over all versions, then versions not in force are dropped.
 
+The top 10 of every run, per question, go to `<name>.ranked.json` for paired tests (scripts/sig_tests.py).
+
 Metrics: R@k (gold version in the top k), Key@k (any version of the gold paragraph in the top k),
 Stale@1 (the top passage is another version of the gold paragraph) and Invalid@5 (share of the top 5
 passages not in force on the as-of date).
@@ -85,7 +87,7 @@ def main() -> None:
     valid_masks = [in_force(passages, date.fromisoformat(it["as_of"])) for it in items]
     valid = {it["qid"]: {pids[i] for i in np.flatnonzero(m)} for it, m in zip(items, valid_masks)}
 
-    results = {}
+    results, ranked = {}, {}
     for policy in args.policy:
         name, _, n = policy.partition(":")
         runs = defaultdict(list)
@@ -109,6 +111,7 @@ def main() -> None:
             for m, l in lists.items():
                 runs[m].append(l)
         for m, r in runs.items():
+            ranked[f"{policy} / {m}"] = [x[:10] for x in r]
             results[f"{policy} / {m}"] = {"all": score(r, items, valid),
                                           **{f"version={v}": score([x for x, it in zip(r, items) if it["version"] == v],
                                                                    [it for it in items if it["version"] == v], valid)
@@ -118,6 +121,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     name = "_".join([args.split, *(p.replace(":", "") for p in args.policy)] + (["rerank"] if args.rerank else []))
     (out / f"{name}.json").write_text(json.dumps(results, indent=2))
+    (out / f"{name}.ranked.json").write_text(json.dumps({"qids": [it["qid"] for it in items], "ranked": ranked}))
     cols = [f"R@{k}" for k in KS] + ["Key@5", "Stale@1", "Invalid@5"]
     print("| policy / retriever | " + " | ".join(cols) + " | old R@1 | new R@1 |")
     print("|---" * (len(cols) + 3) + "|")

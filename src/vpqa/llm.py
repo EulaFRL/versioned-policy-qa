@@ -9,6 +9,11 @@ TOTALS sums them over every call in this process, cached or not, so a rerun repo
 VPQA_CACHE sets the cache directory; an empty one samples the same run again (the models are not
 deterministic at temperature 0). A reply whose reasoning used up max_tokens before any text is asked again
 with four times the room, and cached under the original request.
+
+Tail latency (both off by default, neither part of the cache key): VPQA_HEDGE_S sends a second copy of a
+request that has no reply after that many seconds and keeps whichever copy answers first (a hedged request,
+Dean & Barroso, "The Tail at Scale"); the slower copy still finishes and is counted. VPQA_PROVIDER_SORT asks
+OpenRouter to pick the provider by `latency` or `throughput` instead of by price.
 """
 from __future__ import annotations
 
@@ -18,13 +23,14 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import httpx
 
 CACHE = Path(os.environ.get("VPQA_CACHE", "data/cache/llm"))  # another directory: sample the same run again
 _LOCK = threading.Lock()
-TOTALS = {"calls": 0, "cached": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0, "cost_by_model": {}}
+TOTALS = {"calls": 0, "cached": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0, "cost_by_model": {}, "hedged": 0}
 
 
 def _count(model_name: str, usage: dict | None, cached: bool) -> None:
@@ -46,9 +52,9 @@ def judge_model() -> str:
 
 
 def chat(messages: list[dict], temperature: float = 0.0, max_tokens: int = 800, cache: Path = CACHE,
-         model_name: str | None = None) -> str:
+         model_name: str | None = None, cache_only: bool = False) -> str:
     body = {"model": model_name or model(), "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-    return complete(body, cache).get("content") or ""
+    return complete(body, cache, cache_only=cache_only).get("content") or ""
 
 
 def chat_tools(messages: list[dict], tools: list[dict], tool_choice: str = "auto", temperature: float = 0.0,
@@ -59,18 +65,61 @@ def chat_tools(messages: list[dict], tools: list[dict], tool_choice: str = "auto
     return complete(body, cache)
 
 
-def complete(body: dict, cache: Path = CACHE) -> dict:
-    """The assistant message for a chat/completions request body, cached by the body."""
+def complete(body: dict, cache: Path = CACHE, *, cache_only: bool = False) -> dict:
+    """The assistant message, cached by request body. cache_only raises on a miss without network access."""
     key = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
     path = cache / key[:2] / f"{key}.json"
     if path.exists():
         hit = json.loads(path.read_text())
         _count(body["model"], hit.get("usage"), cached=True)
         return hit.get("message") or {"role": "assistant", "content": hit["content"]}
+    if cache_only:
+        raise FileNotFoundError(f"No cached reply: {path}")
     base = os.environ["VPQA_API_BASE"].rstrip("/")
     headers = {"Authorization": f"Bearer {os.environ['VPQA_API_KEY']}"}
-    message, usage = None, None
     payload = {**body, "usage": {"include": True}} if "openrouter" in base else body  # not part of the cache key
+    if "openrouter" in base and os.environ.get("VPQA_PROVIDER_SORT"):
+        payload = {**payload, "provider": {"sort": os.environ["VPQA_PROVIDER_SORT"]}}
+    hedge = float(os.environ.get("VPQA_HEDGE_S") or 0)
+    message, usage = _hedged(hedge, base, headers, payload, body) if hedge else _fetch(base, headers, payload, body)
+    _count(body["model"], usage, cached=False)
+    if not message or not (message.get("content") or message.get("tool_calls")):  # empty: not cached, retried next run
+        return {"role": "assistant", "content": ""}
+    message = {k: message[k] for k in ("role", "content", "tool_calls") if message.get(k) is not None}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"request": body, "content": message.get("content"), "usage": usage}
+    if "tool_calls" in message:
+        entry["message"] = message
+    tmp = path.with_suffix(f".{threading.get_ident()}.tmp")  # another thread may read the same key
+    tmp.write_text(json.dumps(entry))
+    tmp.replace(path)
+    return message
+
+
+def _hedged(after_s: float, *args) -> tuple[dict | None, dict | None]:
+    """_fetch, sent again if it has not returned after `after_s`; the first copy to succeed wins."""
+    pool = ThreadPoolExecutor(2)
+    futures = [pool.submit(_fetch, *args)]
+    if not wait(futures, timeout=after_s).done:
+        futures.append(pool.submit(_fetch, *args))
+        with _LOCK:
+            TOTALS["hedged"] += 1
+    pending, winner = set(futures), None
+    while pending and winner is None:
+        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+        winner = next((f for f in done if f.exception() is None), None)
+    pool.shutdown(wait=False)
+    for f in futures:
+        if f is not winner:  # the slower copy is paid for too
+            f.add_done_callback(lambda f: _count(args[3]["model"], None if f.exception() else f.result()[1], cached=False))
+    if winner is None:
+        return futures[0].result()  # both failed: raise the first error
+    return winner.result()
+
+
+def _fetch(base: str, headers: dict, payload: dict, body: dict) -> tuple[dict | None, dict | None]:
+    """One request with retries: the assistant message and usage (message None or empty if none came)."""
+    message, usage = None, None
     for attempt in range(20):  # about 15 minutes: rides out a dropped connection
         try:
             r = httpx.post(f"{base}/chat/completions", json=payload, headers=headers, timeout=90)
@@ -91,18 +140,7 @@ def complete(body: dict, cache: Path = CACHE) -> dict:
                                 and e.response.status_code < 500):
                 raise
         time.sleep(min(2 ** attempt, 60))
-    _count(body["model"], usage, cached=False)
-    if not message or not (message.get("content") or message.get("tool_calls")):  # empty: not cached, retried next run
-        return {"role": "assistant", "content": ""}
-    message = {k: message[k] for k in ("role", "content", "tool_calls") if message.get(k) is not None}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    entry = {"request": body, "content": message.get("content"), "usage": usage}
-    if "tool_calls" in message:
-        entry["message"] = message
-    tmp = path.with_suffix(f".{threading.get_ident()}.tmp")  # another thread may read the same key
-    tmp.write_text(json.dumps(entry))
-    tmp.replace(path)
-    return message
+    return message, usage
 
 
 def chat_json(messages: list[dict], **kw) -> dict | None:

@@ -9,13 +9,14 @@ pipeline (no free-form agent loop) with an explicit evidence verifier, and evalu
 separately.
 
 > Status: work in progress. Every number below comes from a run in this repo; stages without numbers
-> are not built yet.
+> are not built yet. The condition check before the answer ([Loop](#offline-improvement-loop)) was adopted last; the answer
+> and refusal numbers before that section were run without it.
 
 ## Pipeline
 
 ```
 query ─▶ route (department) ─▶ corpus filter (effective date) ─▶ hybrid retrieve (BM25 + dense, RRF)
-      ─▶ rerank ─▶ cited answer ─▶ verifier (format, version, support) ─▶ revise ≤ 2 ─▶ answer | refuse | passages
+      ─▶ rerank ─▶ condition check ─▶ cited answer ─▶ verifier (format, version, support) ─▶ revise ≤ 2 ─▶ answer | refuse | passages
 ```
 
 The pipeline is a fixed DAG (`src/vpqa/pipeline/engine.py`, `dag.py`): each node declares typed inputs
@@ -31,11 +32,16 @@ run writes a JSONL trace: the full inputs, then per node its status, latency and
 | [MultiDoc2Dial](https://doc2dial.github.io/multidoc2dial/) | multi-turn, multi-document dialogues with gold grounding spans | 4 domains; used for routing, follow-up rewriting, citation accuracy |
 | [eCFR point-in-time API](https://www.ecfr.gov/developers/documentation/api/v1) | multiple dated versions of the same regulation | 20 CFR 404/416, 38 CFR 3, 34 CFR 668/685 (the regulations behind three MultiDoc2Dial domains); used to build the version-conflict questions |
 
-Raw data is not committed; see `scripts/download_data.py` and `scripts/build_ecfr.py`. The eCFR
-version-conflict questions are committed in `data/benchmark/`: `ecfr_version_qa.jsonl` holds the items,
-`ecfr_version_qa.log.jsonl` the outcome of every candidate pair, including the rejected ones. So are the
-near-miss unanswerable turns built from MultiDoc2Dial (`md2d_near_miss_{train,validation}.jsonl`, see
-[Refusal](#refusal)), every rewrite with the checker's verdict, kept or not.
+This repository includes `data/benchmark/ecfr_version_qa.jsonl`, a synthetic QA set containing CFR
+citations, not copies of regulation text. It is derived from the [official eCFR point-in-time API](https://www.ecfr.gov/developers/documentation/api/v1);
+the generated questions and dates are this project's unofficial research artifact, not an official eCFR
+product. The candidate-pair audit log is omitted. MultiDoc2Dial source data and the near-miss sets are also
+omitted: download the official dataset with `scripts/download_data.py` and regenerate near-miss examples
+with `scripts/make_near_miss.py` after checking the upstream dataset's terms. Dated eCFR passages and the
+version-conflict set can be regenerated with `scripts/build_ecfr.py` and `scripts/make_version_qa.py`;
+question generation uses an LLM. See the [eCFR reader aid](https://www.ecfr.gov/reader-aids/understanding-the-ecfr)
+and the [MultiDoc2Dial project page](https://doc2dial.github.io/multidoc2dial/) for source context. The
+code has no selected license in this repository; no code license is being applied to these datasets.
 
 ## Evaluation
 
@@ -429,7 +435,7 @@ the question is the same and only its date differs. Binding the entry to the ver
 every stale reuse at every τ and returns the no-memory result on new-version questions; in the window it
 also blocks the 2% of entries that cite a second passage which changed in the meantime, the case in which
 unbound reuse is stale even inside the gold version's window. τ 0.9 was chosen on these same items, so
-the full grid is in `runs/answer_memory/ecfr_dev.json`; the test split is not used. About 1 USD.
+the full parameter grid used the dev split; the test split was not used. Raw run outputs are not included.
 
 ### Fixed DAG vs a ReAct agent
 
@@ -580,9 +586,13 @@ it or refuses), **knowledge gap** (a near-miss turn, which the documents do not 
 Each round takes the largest category that still has untried patches in `configs/skills.yaml`. A patch
 changes configuration only (a parameter, or one rule line added to the answer prompt), so applying and
 rolling it back needs no code. The patch is run on the same turns. It is kept only if success on its
-target set rises with an exact McNemar p below 0.05 and success on the other set does not fall with p
-below 0.05; otherwise the configuration rolls back. A kept patch would then be run once on validation
-(300 turns, seed 0).
+target set rises with an exact McNemar p below 0.05 and success on the other set, its guard, does not
+fall materially: by more than 2 points with p below 0.05 (`--margin`); otherwise the configuration rolls
+back. The margin was added after the condition check below; until then any significant drop on the
+guard set rejected a patch, and judged again with the margin, no decision before it changes. It is not a
+non-inferiority test (that would require the confidence interval to exclude a 2-point loss, which these
+sets are too small to show): a large drop that is not significant still passes. A kept patch is then run
+once on validation (300 turns, seed 0).
 
 Train, 200 answerable turns (seed 1) and their 117 near-miss rewrites; DeepSeek V4 Flash answering,
 Sonnet verifying. At the start: answerable success (answered, citing gold) 0.435, near-miss success (not
@@ -667,14 +677,32 @@ uncovered; `any` refuses when any condition is uncovered. Train, 3 samples each:
 | condition check, essential | 0.866 → 0.903 | 0 / 12 | 0.001 | 0.430 → **0.417** | 6 / 0 | 0.03 |
 | condition check, any | 0.866 → 0.920 | 0 / 15 | <0.001 | 0.430 → **0.408** | 8 / 0 | 0.008 |
 
-`note` passed once; run again, it lost 6 answerable turns instead of 5 (p 0.03) and failed, so it sits on
-the threshold. On validation (3 samples) it refuses 32 more near-miss turns and breaks none (0.793 → 0.889,
-p <0.001), and loses 6 answerable turns and gains none (0.384 → 0.377, p 0.03): rejected, and the
-configuration stays as it was. It is the best trade of the refusal patches tried: about 10 points of
-near-miss refusal for under 1 point of answerable success, where the neighbouring-case rule gave 5 for 4.
-The guard here only asks whether the answerable set is significantly worse, and a loss of a few turns in
-the same direction on every sample is; a non-inferiority margin (say, at most 2 points lost) would accept
-it, which is a product decision rather than a statistical one. About 1.5 USD.
+Under the earlier guard (any significant drop rejects), `note` passed once and, run again, lost 6
+answerable turns instead of 5 (0.430 → 0.413, p 0.03) and failed: a loss of a few turns in the same
+direction on every sample is significant however small it is. The drops are 1.2 to 1.7 points, under the
+2-point margin, so with the margin `note` and `essential` pass and `any` (2.2 points) does not; the loop
+would keep `note`, the larger near-miss gain. On validation (3 samples) it refuses 32 more near-miss turns and
+breaks none (0.793 → 0.889, p <0.001), and loses 6 answerable turns and gains none (0.384 → 0.377,
+p 0.03; 95% CI of the change [−0.014, −0.002]). It is now on (`answer.condition_check: note` in
+`configs/baseline.yaml`): about 10 points of near-miss refusal for under 1 point of answerable success,
+where the neighbouring-case rule gave 5 for 4.5. A wrong answer to a case the documents do not cover is
+taken to cost more than a refusal of one they do. It adds one call to the answer model before the answer
+(about 0.0005 USD a turn); its latency was not measured. About 1.5 USD.
+
+### Fine-tuned reranker (experimental)
+
+On the 4,201-turn validation retrieval set, fine-tuning the cross-encoder raises rerank@40 Hit@1 from
+0.225 to 0.362 and Hit@5 from 0.550 to 0.605. In the 300-turn end-to-end validation run, answerable
+success rises from 0.390 to 0.463, while refusal on the 167 withheld turns judged uncovered by both
+top-5 lists falls from 0.611 to 0.539; near-miss refusal changes from 0.782 to 0.741. This trade-off
+keeps the reranker experimental and off by default. The fine-tuned weights are not included; the training script writes them locally for `configs/reranker_md2d.yaml`. These are DeepSeek, 8-worker results. After recovering the interrupted train coverage judgments,
+refusal on the 120 train turns uncovered by both top-5 lists changes from 0.558 to 0.508
+(p=0.362; paired 95% CI of the change [−0.142, +0.042]). See [evaluation summary](docs/evaluation.md).
+
+Coverage labels vary across the three judges (109, 91, and 101 of 300 withheld turns marked covered);
+the 10-item human check remains unfinished. The latency runs include GPU contention and retrieval
+fallbacks, so they do not establish a reliable end-to-end speed gain. The eCFR statistics describe this corpus and its sampled dates; they are not estimates of real-world
+stale-answer risk.
 
 ### Replaying a run from its trace
 
@@ -694,7 +722,7 @@ python scripts/refusal_report.py runs/answers/md2d_validation_n300_s0.jsonl \
     runs/answers/md2d_validation_n300_s0_withheld.jsonl \
     --covered runs/answers/md2d_validation_n300_s0_withheld.covered.json
 python scripts/select_refusal_gate.py --train-n 1000
-python scripts/make_near_miss.py --split validation --n 300 --seed 0   # the files in data/benchmark are these
+python scripts/make_near_miss.py --split validation --n 300 --seed 0   # generates local near-miss examples
 python scripts/eval_answers.py --dataset md2d --n 300 --withhold near-miss
 python scripts/eval_answers.py --dataset ecfr --split dev --n 100 --versions filter   # or unaware / inject
 python scripts/eval_answers.py --dataset ecfr --split test --n 284 --versions filter  # or unaware / inject
@@ -730,15 +758,28 @@ configs/       run configs; skills.yaml, the loop's patches by failure category
 tests/         unit tests for metrics and fusion
 ```
 
-## Setup
+## Quick start
+
+Install the project and run the offline unit tests:
 
 ```bash
 uv venv --python 3.12 .venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
-python scripts/download_data.py
 pytest
 ```
 
-Everything runs on a laptop: embeddings and reranker are local, generation goes through an
-OpenAI-compatible API set by `VPQA_API_BASE` / `VPQA_API_KEY` / `VPQA_MODEL` (the answer model) and
-`VPQA_JUDGE_MODEL` (verifier and eval judges; defaults to `VPQA_MODEL`).
+To prepare local evaluation data, download MultiDoc2Dial and build eCFR snapshots:
+
+```bash
+python scripts/download_data.py
+python scripts/build_ecfr.py
+```
+
+The scripts write datasets and caches under ignored `data/` directories. The eCFR synthetic QA benchmark is included; its audit log and MultiDoc2Dial-derived near-miss files are not. Some evaluation commands call an OpenAI-compatible API. Set `VPQA_API_BASE`,
+`VPQA_API_KEY`, `VPQA_MODEL`, and optionally `VPQA_JUDGE_MODEL` in the shell before running them; an
+empty-variable template is in `.env.example` (the application does not load `.env` automatically).
+
+**Optional paid evaluations:** the full Sonnet answer-and-judge reproduction was estimated at about
+$11 in the original run; actual cost depends on model pricing, cache state, and which commands you run.
+The condition-check adds one answer-model call per turn (about $0.0005 per turn in the measured run).
+These commands are not part of setup or the test suite; do not run them without setting a budget.

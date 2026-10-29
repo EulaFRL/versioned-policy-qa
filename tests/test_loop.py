@@ -1,4 +1,4 @@
-from vpqa.loop import attribute, bootstrap_diff, mcnemar, merge, sign_flip
+from vpqa.loop import attribute, bootstrap_diff, mcnemar, merge, passes, sign_flip
 
 
 def test_merge_nested_and_lists():
@@ -39,3 +39,13 @@ def test_sign_flip_matches_mcnemar_on_single_samples():
     assert sign_flip(a, a) == (0, 0, 1.0)
     # means over samples: a turn that rose from 1/3 to 2/3 counts once
     assert sign_flip([1 / 3, 1.0], [2 / 3, 1.0])[:2] == (0, 1)
+
+
+def test_passes_rejects_only_a_significant_and_material_guard_drop():
+    gain = {"a": 0.866, "b": 0.917, "only_a": 0, "only_b": 14, "p": 0.0001}
+    guard = lambda a, b, p: {"a": a, "b": b, "only_a": 6, "only_b": 0, "p": p}
+    assert passes(gain, guard(0.430, 0.413, 0.033), 0.05, 0.02)       # significant, 1.7 points
+    assert not passes(gain, guard(0.435, 0.390, 0.049), 0.05, 0.02)   # significant, 4.5 points
+    assert passes(gain, guard(0.435, 0.390, 0.2), 0.05, 0.02)         # 4.5 points, not significant
+    assert not passes(gain, guard(0.430, 0.413, 0.033), 0.05, 0.0)    # margin 0: any significant drop
+    assert not passes({**gain, "p": 0.07}, guard(0.43, 0.43, 1.0), 0.05, 0.02)

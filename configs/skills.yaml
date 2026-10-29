@@ -27,9 +27,6 @@
 - name: question-check
   category: knowledge gap
   patch: {answer: {check_question: true}}
-- name: conditions-note
-  category: knowledge gap
-  patch: {answer: {condition_check: note}}  # uncovered conditions of the message are named in the answer prompt
 - name: conditions-essential
   category: knowledge gap
   patch: {answer: {condition_check: essential}}  # refuse if a condition the answer depends on is not covered

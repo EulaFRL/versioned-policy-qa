@@ -1,9 +1,27 @@
+# Python environments and build artifacts
 .venv/
 __pycache__/
 *.egg-info/
+.pytest_cache/
+
+# Credentials; keep the template tracked
+.env
+.env.*
+!.env.example
+
+# Downloaded datasets, indexes, caches, model weights, and generated runs
 data/raw/
 data/index/
-runs/
-.env
 data/processed/
 data/cache/
+data/benchmark/ecfr_version_qa.log.jsonl
+data/benchmark/md2d_near_miss_*.jsonl
+runs/
+models/
+*.safetensors
+
+# Local agent handoff and unrelated site artifacts
+AGENTS.md
+.agents/
+review-mobile-10/
+review-mobile-10-deploy.tar.gz
